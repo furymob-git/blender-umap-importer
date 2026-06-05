@@ -106,6 +106,12 @@ class MISettings(bpy.types.PropertyGroup):
         description="Do not refresh the 3D viewport during import to significantly speed up the process",
         default=True,
     )
+    use_smart_resolve: bpy.props.BoolProperty(
+        name="Smart Asset Recognition",
+        description="Fuzzy matching for asset variants, suffixes and families (e.g. Mi_Decal_Leak02a -> Mi_Decal_Leak02a1, or Mi_Decal_Vertical_A -> Mi_Decal_Vertical_B)",
+        default=True,
+        update=update_analysis,
+    )
     show_analysis: bpy.props.BoolProperty(
         name="Show Asset Analysis",
         description="Check and show a summary of missing assets and folders",
@@ -159,6 +165,7 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
         self.layout.prop(mytool, "json_file")
         self.layout.prop(mytool, "base_directory")
         self.layout.prop(mytool, "disable_viewport_refresh")
+        self.layout.prop(mytool, "use_smart_resolve")
         self.layout.prop(mytool, "hide_collisions")
         self.layout.prop(mytool, "skip_missing_assets")
         self.layout.prop(mytool, "skip_missing_materials")
@@ -375,6 +382,14 @@ def index_directory(base_dir):
     return index
 
 _resolve_cache = {}
+_sorted_keys_cache = {}
+
+def get_sorted_keys(index):
+    global _sorted_keys_cache
+    index_id = id(index)
+    if index_id not in _sorted_keys_cache:
+        _sorted_keys_cache[index_id] = sorted([k for k in index.keys() if isinstance(k, str)])
+    return _sorted_keys_cache[index_id]
 
 def resolve_file_path(index, ue_path, preferred_exts=None):
     """
@@ -430,7 +445,69 @@ def _resolve_file_path_internal(index, ue_path, preferred_exts=None):
                 return filtered[0]
         return candidates[0]
         
+    # Check settings for smart resolution
+    use_smart = True
+    try:
+        use_smart = bpy.context.scene.my_tool.use_smart_resolve
+    except Exception:
+        pass
+
+    if not use_smart:
+        return None
+
+    # --- Loose / Variant Fallback Matching ---
+    import re
+    
+    # Generate potential fallback base names in order of specificity.
+    fallback_bases = []
+    
+    # 1. Prefix match (requested is prefix of existing, e.g. "mi_decal_leak02a" -> "mi_decal_leak02a1")
+    fallback_bases.append((filename, "prefix"))
+    
+    # 2. Strip trailing digits (e.g. "mi_decal_leak02a1" -> "mi_decal_leak02a")
+    base_no_digits = re.sub(r'\d+$', '', filename)
+    if base_no_digits and base_no_digits != filename and len(base_no_digits) >= 4:
+        fallback_bases.append((base_no_digits, "base without digits"))
+        
+    # 3. Strip underscore variant (e.g. "mi_decal_vertical_a" -> "mi_decal_vertical")
+    base_no_under = re.sub(r'_[a-z\d]$', '', filename)
+    if base_no_under and base_no_under != filename and len(base_no_under) >= 4:
+        fallback_bases.append((base_no_under, "base without underscore variant"))
+        
+    # 4. Strip single trailing character (e.g. "mi_decal_leak02a" -> "mi_decal_leak02")
+    base_no_char = re.sub(r'[a-z\d]$', '', filename)
+    if base_no_char and base_no_char != filename and len(base_no_char) >= 4:
+        fallback_bases.append((base_no_char, "base without trailing char"))
+
+    import bisect
+    sorted_keys = get_sorted_keys(index)
+
+    # Try each fallback base name in order
+    for base, desc in fallback_bases:
+        candidates = []
+        # Binary search for the first key starting with or greater than base
+        idx = bisect.bisect_left(sorted_keys, base)
+        while idx < len(sorted_keys):
+            key = sorted_keys[idx]
+            if key.startswith(base):
+                candidates.extend(index[key])
+                idx += 1
+            else:
+                break
+                
+        if candidates:
+            candidates.sort()  # Sort alphabetically to be deterministic and pick the lowest/first variant
+            if preferred_exts:
+                filtered = [c for c in candidates if os.path.splitext(c)[1].lower() in preferred_exts]
+                if filtered:
+                    print(f"Warning: Exact asset '{ue_path}' not found. Using smart fallback ({desc}): '{os.path.basename(filtered[0])}'")
+                    return filtered[0]
+            fallback_path = candidates[0]
+            print(f"Warning: Exact asset '{ue_path}' not found. Using smart fallback ({desc}): '{os.path.basename(fallback_path)}'")
+            return fallback_path
+
     return None
+
 
 _blueprint_mesh_cache = {}
 _blueprint_properties_cache = {}
@@ -733,7 +810,8 @@ def run_asset_analysis(mytool):
     """
     Processes all level JSON assets, verifies existence, and groups missing/total counts by folder.
     """
-    global _analysis_results
+    global _analysis_results, _resolve_cache
+    _resolve_cache.clear()
     json_path = mytool.json_file
     base_dir = mytool.base_directory
     
@@ -2222,10 +2300,11 @@ class RefreshAnalysisOperator(bpy.types.Operator):
         base_dir = mytool.base_directory
         if base_dir:
             norm_dir = os.path.abspath(base_dir).lower()
-            global _index_cache, _resolve_cache
+            global _index_cache, _resolve_cache, _sorted_keys_cache
             if norm_dir in _index_cache:
                 del _index_cache[norm_dir]
             _resolve_cache.clear()
+            _sorted_keys_cache.clear()
         try:
             run_asset_analysis(mytool)
             self.report({'INFO'}, "Asset analysis refreshed.")
