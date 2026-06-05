@@ -12,6 +12,7 @@ import json
 import os
 import math
 import mathutils
+import time
 
 def update_analysis(self, context):
     try:
@@ -61,6 +62,16 @@ class MISettings(bpy.types.PropertyGroup):
         description="Do not create Empty placeholders for missing 3D meshes and clean up empty groups",
         default=False,
     )
+    skip_missing_materials: bpy.props.BoolProperty(
+        name="Skip Missing Materials",
+        description="Do not import objects whose corresponding material JSON files are missing on disk",
+        default=False,
+    )
+    disable_viewport_refresh: bpy.props.BoolProperty(
+        name="Disable Viewport Refresh",
+        description="Do not refresh the 3D viewport during import to significantly speed up the process",
+        default=True,
+    )
     show_analysis: bpy.props.BoolProperty(
         name="Show Asset Analysis",
         description="Check and show a summary of missing assets and folders",
@@ -87,6 +98,19 @@ class MISettings(bpy.types.PropertyGroup):
     )
     analysis_folders: bpy.props.CollectionProperty(type=LIS_ReferencedFolderItem)
     analysis_folders_index: bpy.props.IntProperty(default=0)
+    import_progress: bpy.props.FloatProperty(
+        name="Import Progress",
+        description="Current import progress percentage",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        subtype='PERCENTAGE',
+    )
+    import_status: bpy.props.StringProperty(
+        name="Import Status",
+        description="Current step of the import process",
+        default="Idle",
+    )
 
 class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
@@ -102,10 +126,22 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
         self.layout.prop(mytool, "base_directory")
         self.layout.prop(mytool, "hide_collisions")
         self.layout.prop(mytool, "skip_missing_assets")
+        self.layout.prop(mytool, "skip_missing_materials")
+        self.layout.prop(mytool, "disable_viewport_refresh")
         
         row = self.layout.row()
         row.operator(MapImporter.bl_idname, text="Import Level")
-        self.layout.label(text="Blender will be unresponsive during import.", icon="ERROR")
+        
+        if mytool.import_progress > 0.0 and mytool.import_progress < 100.0:
+            box = self.layout.box()
+            box.label(text=mytool.import_status, icon="INFO")
+            row_prog = box.row()
+            row_prog.prop(mytool, "import_progress", text="Progress", slider=True)
+            row_prog.enabled = False
+            box.label(text="Press ESC in 3D View to cancel", icon="CANCEL")
+        elif mytool.import_progress == 100.0:
+            box = self.layout.box()
+            box.label(text="Import completed successfully!", icon="CHECKMARK")
         
         self.layout.separator()
         
@@ -193,7 +229,25 @@ def index_directory(base_dir):
     print(f"Scanned {sum(len(v) for v in index.values())} keys in asset index.")
     return index
 
+_resolve_cache = {}
+
 def resolve_file_path(index, ue_path, preferred_exts=None):
+    """
+    Wrapper around _resolve_file_path_internal that uses a global cache
+    to avoid redundant string manipulation and lookups.
+    """
+    if not ue_path:
+        return None
+    global _resolve_cache
+    ext_key = tuple(sorted(preferred_exts)) if preferred_exts else None
+    cache_key = (ue_path, ext_key)
+    if cache_key in _resolve_cache:
+        return _resolve_cache[cache_key]
+    res = _resolve_file_path_internal(index, ue_path, preferred_exts)
+    _resolve_cache[cache_key] = res
+    return res
+
+def _resolve_file_path_internal(index, ue_path, preferred_exts=None):
     """
     Resolves an Unreal virtual asset path to a physical path on disk using
     the pre-scanned folder index. Supports flexible matching.
@@ -233,13 +287,19 @@ def resolve_file_path(index, ue_path, preferred_exts=None):
         
     return None
 
+_blueprint_mesh_cache = {}
+
 def resolve_blueprint_mesh(index, template_path):
     """
     Loads and parses a blueprint class template JSON to find the default
-    StaticMesh path if it is null or missing in the UMAP level JSON.
+    StaticMesh or SkeletalMesh path if it is null or missing in the UMAP level JSON.
     """
     if not template_path:
         return None
+        
+    global _blueprint_mesh_cache
+    if template_path in _blueprint_mesh_cache:
+        return _blueprint_mesh_cache[template_path]
         
     parts = template_path.split('.')
     bp_path = parts[0]
@@ -250,6 +310,7 @@ def resolve_blueprint_mesh(index, template_path):
         
     bp_json_path = resolve_file_path(index, bp_path, preferred_exts={'.json'})
     if not bp_json_path or not os.path.exists(bp_json_path):
+        _blueprint_mesh_cache[template_path] = None
         return None
         
     try:
@@ -263,23 +324,111 @@ def resolve_blueprint_mesh(index, template_path):
         if suffix_idx is not None and suffix_idx < len(bp_data):
             obj = bp_data[suffix_idx]
         else:
-            # Fallback: search for first object with a StaticMesh property
+            # Fallback: search for first object with a StaticMesh or SkeletalMesh property
             for item in bp_data:
                 if isinstance(item, dict):
                     props = item.get("Properties", {})
-                    if "StaticMesh" in props:
+                    if "StaticMesh" in props or "SkeletalMesh" in props:
                         obj = item
                         break
             
         if obj:
             props = obj.get("Properties", {})
-            sm_ref = props.get("StaticMesh")
+            sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
             if sm_ref and isinstance(sm_ref, dict):
-                return sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
+                res = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
+                _blueprint_mesh_cache[template_path] = res
+                return res
     except Exception as e:
         print(f"Error parsing blueprint template {bp_json_path}: {e}")
         
+    _blueprint_mesh_cache[template_path] = None
     return None
+
+def should_skip_component_due_to_missing_materials(etype, props, file_index):
+    """
+    Checks if overridden materials for a mesh or decal component are missing from disk.
+    Returns True if skip_missing_materials is enabled and we should skip importing this component.
+    """
+    mats_to_check = []
+    if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent", "SkeletalMeshComponent"):
+        override_mats = props.get("OverrideMaterials", [])
+        for mat in override_mats:
+            if mat:
+                mat_path = mat.get("ObjectPath") or mat.get("ObjectName")
+                if mat_path:
+                    mat_name = clean_unreal_path(mat_path)
+                    if mat_name:
+                        mats_to_check.append(mat_name)
+    elif etype == "DecalComponent":
+        mat_ref = props.get("DecalMaterial")
+        if mat_ref:
+            mat_path = mat_ref.get("ObjectPath") or mat_ref.get("ObjectName")
+            if mat_path:
+                mat_name = clean_unreal_path(mat_path)
+                if mat_name:
+                    mats_to_check.append(mat_name)
+                    
+    # If overridden materials are referenced, check if any of them exist on disk
+    if mats_to_check:
+        any_found = False
+        for mat_name in mats_to_check:
+            if resolve_file_path(file_index, mat_name, preferred_exts={'.json', '.mat'}):
+                any_found = True
+                break
+        if not any_found:
+            return True
+            
+    return False
+
+def is_material_transparent(mat_name, mat_data):
+    """
+    Checks if a material should be translucent or masked based on its name and properties.
+    """
+    # 1. Check material name keywords
+    name_lower = mat_name.lower()
+    transparent_keywords = {"glass", "translucent", "water", "decal", "window", "fence", "grate", "leaves", "foliage", "hair", "alpha"}
+    for kw in transparent_keywords:
+        if kw in name_lower:
+            return True
+            
+    # 2. Check JSON data for BlendMode properties
+    def check_dict_for_transparency(d):
+        if not isinstance(d, dict):
+            return False
+        for k, v in d.items():
+            if k == "BlendMode":
+                v_str = str(v).lower()
+                if "masked" in v_str or "translucent" in v_str or "additive" in v_str:
+                    return True
+            elif k == "bIsMasked" and v is True:
+                return True
+            elif isinstance(v, (dict, list)):
+                if check_dict_for_transparency(v):
+                    return True
+        return False
+        
+    def check_list_for_transparency(lst):
+        if not isinstance(lst, list):
+            return False
+        for item in lst:
+            if isinstance(item, dict):
+                if check_dict_for_transparency(item):
+                    return True
+            elif isinstance(item, list):
+                if check_list_for_transparency(item):
+                    return True
+        return False
+
+    if mat_data:
+        if isinstance(mat_data, dict):
+            if check_dict_for_transparency(mat_data):
+                return True
+        elif isinstance(mat_data, list):
+            if check_list_for_transparency(mat_data):
+                return True
+                
+    return False
 
 # -----------------------------------------------------------------------------
 # GLOBAL CACHE & STATE FOR ASSET ANALYSIS
@@ -350,8 +499,8 @@ def get_all_referenced_assets(json_filepath, base_dir=None, file_index=None):
             etype = entity.get("Type", "")
             
             # 1. Mesh components
-            if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent"):
-                sm_ref = props.get("StaticMesh")
+            if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent", "SkeletalMeshComponent"):
+                sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
                 if sm_ref:
                     mesh_path = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
                     if mesh_path:
@@ -526,8 +675,8 @@ def get_blender_transform(loc_dict, rot_dict, scale_dict):
         pitch = rot_dict.get("Pitch", 0.0)
         yaw = rot_dict.get("Yaw", 0.0)
         roll = rot_dict.get("Roll", 0.0)
-        # Unreal applies ZYX order (Yaw -> Pitch -> Roll) in left-handed coordinates
-        euler_ue = mathutils.Euler((math.radians(roll), math.radians(pitch), math.radians(yaw)), 'ZYX')
+        # Unreal applies Roll -> Pitch -> Yaw (X -> Y -> Z) order
+        euler_ue = mathutils.Euler((math.radians(roll), math.radians(pitch), math.radians(yaw)), 'XYZ')
         rot_mat_ue = euler_ue.to_matrix().to_4x4()
         
     # Change basis for left-to-right handed conversion: C = diag(1, -1, 1)
@@ -659,29 +808,32 @@ def import_asset(filepath, name, collection, hide_collisions=False):
 def create_decal_plane_mesh(name, material, collection):
     """
     Generates a quad mesh plane representing the Decal projection area,
-    wound to face +X (projection axis) and offset by 0.5cm to avoid Z-fighting.
+    wound to face -X (away from the wall) and offset by -0.1cm to avoid Z-fighting.
+    Its base size corresponds to 128x128cm (0.64m half-extent), matching the
+    default Unreal Decal size.
     """
     mesh_data = bpy.data.meshes.new(name=f"{name}_Mesh")
     
-    # Vertices of the YZ plane facing +X (normal), offset by 0.005m (0.5cm) to prevent Z-fighting
+    # Vertices of the YZ plane facing -X (normal), offset by -0.001m (-0.1cm) to prevent Z-fighting.
+    # Half-size is 0.64m (total 1.28m, matching 128cm default Unreal decal size).
     verts = [
-        (0.005, -1.28, -1.28),
-        (0.005,  1.28, -1.28),
-        (0.005,  1.28,  1.28),
-        (0.005, -1.28,  1.28)
+        (-0.001, -0.64, -0.64), # Bottom-Right (looking at -X)
+        (-0.001, -0.64,  0.64), # Top-Right
+        (-0.001,  0.64,  0.64), # Top-Left
+        (-0.001,  0.64, -0.64)  # Bottom-Left
     ]
     faces = [(0, 1, 2, 3)]
     
     mesh_data.from_pydata(verts, [], faces)
     mesh_data.update()
     
-    # Add UV coordinates so the texture maps correctly
+    # Add UV coordinates to prevent horizontal mirroring
     mesh_data.uv_layers.new(name="UVMap")
     uv_layer = mesh_data.uv_layers.active.data
-    uv_layer[0].uv = (0.0, 0.0)
-    uv_layer[1].uv = (1.0, 0.0)
-    uv_layer[2].uv = (1.0, 1.0)
-    uv_layer[3].uv = (0.0, 1.0)
+    uv_layer[0].uv = (1.0, 0.0) # Bottom-Right
+    uv_layer[1].uv = (1.0, 1.0) # Top-Right
+    uv_layer[2].uv = (0.0, 1.0) # Top-Left
+    uv_layer[3].uv = (0.0, 0.0) # Bottom-Left
     
     obj = bpy.data.objects.new(name=name, object_data=mesh_data)
     collection.objects.link(obj)
@@ -700,8 +852,119 @@ class MapImporter(bpy.types.Operator):
     bl_idname = "lis.map_import"
     bl_label = "Import Level"
     bl_options = {'REGISTER', 'UNDO'}
+    
+    _timer = None
+    generator = None
 
     def execute(self, context):
+        import gc
+        self.gc_was_enabled = gc.isenabled()
+        if self.gc_was_enabled:
+            gc.disable()
+
+        if bpy.app.background:
+            # Headless fallback: run synchronously
+            print("Running in background/headless mode. Running synchronously...")
+            gen = self.import_generator(context)
+            try:
+                while not next(gen):
+                    pass
+            except StopIteration:
+                pass
+            if self.gc_was_enabled:
+                gc.enable()
+                gc.collect()
+            return {'FINISHED'}
+            
+        # Interactive mode: run modally with a timer
+        scene = context.scene
+        mytool = scene.my_tool
+        mytool.import_progress = 0.0
+        mytool.import_status = "Starting..."
+        
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.001, window=context.window)
+        wm.modal_handler_add(self)
+        
+        json_filename = os.path.basename(mytool.json_file)
+        self.collection_name = os.path.splitext(json_filename)[0]
+        
+        self.generator = self.import_generator(context)
+        self.last_redraw_time = 0.0
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        scene = context.scene
+        mytool = scene.my_tool
+        
+        if event.type == 'ESC':
+            self.report_cleanup(context)
+            self.report({'INFO'}, "Import cancelled.")
+            return {'CANCELLED'}
+            
+        if event.type == 'TIMER':
+            try:
+                finished = next(self.generator)
+                
+                # Check redraw rate limit
+                should_redraw = True
+                if mytool.disable_viewport_refresh:
+                    current_time = time.time()
+                    if current_time - self.last_redraw_time < 1.0 and not finished:
+                        should_redraw = False
+                
+                if should_redraw:
+                    self.last_redraw_time = time.time()
+                    for window in context.window_manager.windows:
+                        for area in window.screen.areas:
+                            area.tag_redraw()
+                        
+                if finished:
+                    self.report_cleanup(context)
+                    self.report({'INFO'}, "Import finished successfully.")
+                    return {'FINISHED'}
+            except StopIteration:
+                self.report_cleanup(context)
+                return {'FINISHED'}
+            except Exception as e:
+                self.report_cleanup(context)
+                self.report({'ERROR'}, f"Import failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return {'CANCELLED'}
+                
+        return {'PASS_THROUGH'}
+
+    def report_cleanup(self, context):
+        wm = context.window_manager
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        self.generator = None
+        
+        # Restore viewport visibility of the collection if it was hidden
+        if hasattr(self, 'collection_name') and self.collection_name:
+            import_collection = bpy.data.collections.get(self.collection_name)
+            if import_collection:
+                import_collection.hide_viewport = False
+                
+        # Re-enable garbage collection if it was disabled
+        if hasattr(self, 'gc_was_enabled') and self.gc_was_enabled:
+            import gc
+            if not gc.isenabled():
+                gc.enable()
+                gc.collect()
+                
+        # Reset progress values
+        context.scene.my_tool.import_progress = 0.0
+        context.scene.my_tool.import_status = "Idle"
+
+    def import_generator(self, context):
+        # Clear caches for a fresh import
+        global _blueprint_mesh_cache, _resolve_cache
+        _blueprint_mesh_cache.clear()
+        _resolve_cache.clear()
+
         scene = context.scene
         mytool = scene.my_tool
         
@@ -709,16 +972,21 @@ class MapImporter(bpy.types.Operator):
         map_json = mytool.json_file
         hide_collisions = mytool.hide_collisions
         skip_missing_assets = mytool.skip_missing_assets
+        skip_missing_materials = mytool.skip_missing_materials
         
-        if not os.path.exists(map_json):
-            self.report({'ERROR'}, f"Level JSON file not found: {map_json}")
-            return {'CANCELLED'}
-            
         # 1. Directory indexing
-        file_index = index_directory(base_dir)
+        mytool.import_status = "Scanning asset directory..."
+        mytool.import_progress = 5.0
+        yield False
         
-        # 2. Load and parse level JSON
-        print(f"Parsing level JSON: {map_json}")
+        file_index = get_cached_index(base_dir)
+        mytool.import_progress = 10.0
+        yield False
+        
+        # 2. Parse level JSON
+        mytool.import_status = "Parsing level JSON..."
+        yield False
+        
         with open(map_json, 'r', encoding='utf-8') as f:
             json_data = json.load(f)
             
@@ -726,7 +994,6 @@ class MapImporter(bpy.types.Operator):
             json_data = [json_data]
             
         total_objects = len(json_data)
-        object_by_index = {i: obj for i, obj in enumerate(json_data)}
         
         # Create map collection
         json_filename = os.path.basename(map_json)
@@ -736,20 +1003,27 @@ class MapImporter(bpy.types.Operator):
             import_collection = bpy.data.collections.new(collection_name)
             bpy.context.scene.collection.children.link(import_collection)
             
+        if mytool.disable_viewport_refresh:
+            import_collection.hide_viewport = True
+            
         blender_objs = {}
         local_matrices = {}
         mesh_cache = {}
         parent_relations = {} # child index -> parent index
-        
-        # Start Blender GUI progress bar
-        context.window_manager.progress_begin(0, total_objects)
+        decal_objs = []
         
         # Pass 1: Instantiation of all Actors and Components
-        print("Pass 1: Creating Blender objects...")
+        last_yield_time = time.time()
+        time_slice = 0.2 if mytool.disable_viewport_refresh else 0.015
+        
         for i, entity in enumerate(json_data):
-            # Update progress indicator
-            context.window_manager.progress_update(i)
-            
+            # Time-slicing: yield to Blender so it updates the UI/viewport
+            if time.time() - last_yield_time > time_slice:
+                mytool.import_status = f"Importing components ({i}/{total_objects})..."
+                mytool.import_progress = 10.0 + (i / total_objects) * 70.0 # scale loop to 10% - 80% range
+                yield False
+                last_yield_time = time.time()
+                
             etype = entity.get("Type", "")
             ename = entity.get("Name", f"Obj_{i}")
             
@@ -801,14 +1075,19 @@ class MapImporter(bpy.types.Operator):
             elif outer_index is not None:
                 parent_relations[i] = outer_index
                 
+            # Skip component if missing overridden materials and toggle is on
+            if skip_missing_materials and should_skip_component_due_to_missing_materials(etype, props, file_index):
+                print(f"Skipping component {ename} because its overridden materials are missing from disk.")
+                continue
+                
             # Parse component categories
-            if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent"):
-                sm_ref = props.get("StaticMesh")
+            if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent", "SkeletalMeshComponent"):
+                sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
                 mesh_path = None
                 if sm_ref:
                     mesh_path = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
                 else:
-                    # Try resolving static mesh from template blueprint JSON
+                    # Try resolving static/skeletal mesh from template blueprint JSON
                     template_ref = entity.get("Template")
                     if template_ref:
                         template_path = template_ref.get("ObjectPath")
@@ -833,22 +1112,23 @@ class MapImporter(bpy.types.Operator):
                     import_collection.objects.link(comp_empty)
                     blender_objs[i] = comp_empty
                     
-                    mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
-                    if not mesh_file:
-                        print(f"Asset file not found for: {mesh_path}")
-                        continue
-                        
                     # Cache/import the template mesh
                     base_mesh = None
                     if mesh_path in mesh_cache:
                         base_mesh = mesh_cache[mesh_path]
                     else:
-                        base_mesh = import_asset(mesh_file, f"{ename}_Template", import_collection, hide_collisions)
-                        if base_mesh:
-                            mesh_cache[mesh_path] = base_mesh
-                            base_mesh.hide_viewport = True
-                            base_mesh.hide_render = True
-                            
+                        mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
+                        if mesh_file:
+                            base_mesh = import_asset(mesh_file, f"{ename}_Template", import_collection, hide_collisions)
+                            if base_mesh:
+                                mesh_cache[mesh_path] = base_mesh
+                                base_mesh.hide_viewport = True
+                                base_mesh.hide_render = True
+                                
+                    if not base_mesh:
+                        print(f"Asset file not found or failed to import for: {mesh_path}")
+                        continue
+                        
                     if base_mesh:
                         for inst_idx, inst in enumerate(instances):
                             trans_data = inst.get("TransformData", {})
@@ -865,23 +1145,16 @@ class MapImporter(bpy.types.Operator):
                             
                 else:
                     # Single mesh import logic
-                    mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
-                    if not mesh_file:
-                        print(f"Asset file not found for: {mesh_path}")
-                        if not skip_missing_assets:
-                            empty_obj = bpy.data.objects.new(name=ename, object_data=None)
-                            import_collection.objects.link(empty_obj)
-                            blender_objs[i] = empty_obj
-                        continue
-                        
                     mesh_obj = None
                     if mesh_path in mesh_cache:
                         mesh_obj = clone_hierarchy(mesh_cache[mesh_path], ename, import_collection, unhide=True, hide_collisions=hide_collisions)
                     else:
-                        mesh_obj = import_asset(mesh_file, ename, import_collection, hide_collisions)
-                        if mesh_obj:
-                            mesh_cache[mesh_path] = mesh_obj
-                            
+                        mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
+                        if mesh_file:
+                            mesh_obj = import_asset(mesh_file, ename, import_collection, hide_collisions)
+                            if mesh_obj:
+                                mesh_cache[mesh_path] = mesh_obj
+                                
                     if mesh_obj:
                         blender_objs[i] = mesh_obj
                     else:
@@ -931,13 +1204,15 @@ class MapImporter(bpy.types.Operator):
                         
                 decal_obj = create_decal_plane_mesh(ename, material_obj, import_collection)
                 blender_objs[i] = decal_obj
+                decal_objs.append((decal_obj, props))
                 
                 # Apply DecalSize if present in properties
                 decal_size = props.get("DecalSize", {})
                 if decal_size:
+                    ds_x = decal_size.get("X", 128.0) / 128.0
                     ds_y = decal_size.get("Y", 128.0) / 128.0
                     ds_z = decal_size.get("Z", 128.0) / 128.0
-                    scale_decal_mat = mathutils.Matrix.Diagonal((1.0, ds_y, ds_z, 1.0))
+                    scale_decal_mat = mathutils.Matrix.Diagonal((ds_x, ds_y, ds_z, 1.0))
                     local_matrices[i] = local_matrices[i] @ scale_decal_mat
                 
             # Default component wrapper (SceneComponent)
@@ -947,7 +1222,10 @@ class MapImporter(bpy.types.Operator):
                 blender_objs[i] = empty_obj
                 
         # Pass 2: Parenting Links
-        print("Pass 2: Establishing parenting structures...")
+        mytool.import_status = "Establishing parenting structures..."
+        mytool.import_progress = 85.0
+        yield False
+        
         for i, obj in blender_objs.items():
             if i in parent_relations:
                 p_idx = parent_relations[i]
@@ -956,37 +1234,103 @@ class MapImporter(bpy.types.Operator):
                     
         # Clean up empty wrappers if skip_missing_assets is enabled
         if skip_missing_assets:
-            print("Cleaning up empty placeholders...")
-            removed_any = True
-            while removed_any:
-                removed_any = False
-                to_remove = []
-                for i, obj in list(blender_objs.items()):
-                    if obj.type == 'EMPTY' and not obj.children:
-                        to_remove.append((i, obj))
-                        
-                for i, obj in to_remove:
+            mytool.import_status = "Cleaning up empty placeholders..."
+            mytool.import_progress = 90.0
+            yield False
+            
+            def get_depth(obj):
+                depth = 0
+                while obj.parent:
+                    depth += 1
+                    obj = obj.parent
+                return depth
+                
+            empties = [(i, obj) for i, obj in blender_objs.items() if obj.type == 'EMPTY']
+            empties.sort(key=lambda x: get_depth(x[1]), reverse=True)
+            
+            for i, obj in empties:
+                if not obj.children:
                     if obj.name in import_collection.objects:
                         import_collection.objects.unlink(obj)
                     bpy.data.objects.remove(obj, do_unlink=True)
                     del blender_objs[i]
                     if i in local_matrices:
                         del local_matrices[i]
-                    removed_any = True
                     
         # Pass 3: Apply transforms
-        print("Pass 3: Assigning transformations...")
+        mytool.import_status = "Assigning transformations..."
+        mytool.import_progress = 95.0
+        yield False
+        
         for i, obj in blender_objs.items():
             if i in local_matrices:
                 obj.matrix_basis = local_matrices[i]
                 
-        # End progress bar
-        context.window_manager.progress_end()
-        
-        print("Level mesh import finished successfully.")
+        # Decal Projection/Snapping Phase
+        if decal_objs:
+            mytool.import_status = "Projecting decals onto walls..."
+            mytool.import_progress = 97.0
+            yield False
+            
+            # Temporarily show the collection so Blender can build the dependency graph for raycasting
+            if import_collection:
+                import_collection.hide_viewport = False
+            
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
+            
+            for decal_obj, props in decal_objs:
+                try:
+                    # Get decal size
+                    decal_size = props.get("DecalSize", {})
+                    # Default X size in Unreal is 128.0 cm = 1.28 meters
+                    depth = decal_size.get("X", 128.0) / 100.0
+                    
+                    # Raycast origin and direction in world space
+                    world_matrix = decal_obj.matrix_world
+                    # Start at the back of the projection box (local X = -depth/2)
+                    ray_origin = world_matrix @ mathutils.Vector((-depth / 2.0, 0.0, 0.0))
+                    # Raycast along the local +X axis
+                    ray_direction = (world_matrix.to_3x3() @ mathutils.Vector((1.0, 0.0, 0.0))).normalized()
+                    
+                    success, hit_loc, hit_norm, hit_index, hit_obj, hit_matrix = context.scene.ray_cast(
+                        depsgraph, ray_origin, ray_direction, distance=depth
+                    )
+                    
+                    if success and hit_obj and hit_obj != decal_obj and hit_obj.type == 'MESH':
+                        # Ignore other decals or physical collisions
+                        if "decal" not in hit_obj.name.lower() and not is_collision_mesh(hit_obj.name):
+                            # Add a Shrinkwrap modifier to snap the decal mesh to the wall
+                            mod = decal_obj.modifiers.new(name="DecalProject", type='SHRINKWRAP')
+                            mod.target = hit_obj
+                            mod.wrap_method = 'PROJECT'
+                            mod.wrap_mode = 'ON_SURFACE'
+                            mod.project_limit = depth
+                            mod.use_project_x = True
+                            mod.use_project_y = False
+                            mod.use_project_z = False
+                            mod.use_negative_direction = False
+                            mod.use_positive_direction = True
+                            mod.offset = 0.0015  # 1.5mm offset to prevent Z-fighting
+                except Exception as e:
+                    print(f"Error projecting decal {decal_obj.name}: {e}")
+            
+            # Hide the collection again if disable_viewport_refresh was active
+            if mytool.disable_viewport_refresh and import_collection:
+                import_collection.hide_viewport = True
+                
         # Trigger materials rebuild
+        mytool.import_status = "Importing materials..."
+        mytool.import_progress = 98.0
+        yield False
+        
         bpy.ops.lis.mat_import()
-        return {'FINISHED'}
+        
+        mytool.import_status = "Import complete!"
+        mytool.import_progress = 100.0
+        if mytool.disable_viewport_refresh and import_collection:
+            import_collection.hide_viewport = False
+        yield True
 
 class MaterialImporter(bpy.types.Operator):
     bl_idname = "lis.mat_import"
@@ -999,7 +1343,7 @@ class MaterialImporter(bpy.types.Operator):
         base_dir = mytool.base_directory
         
         # Index asset directory for materials/textures
-        file_index = index_directory(base_dir)
+        file_index = get_cached_index(base_dir)
         
         # Material deduplication
         materials = bpy.data.materials
@@ -1011,16 +1355,7 @@ class MaterialImporter(bpy.types.Operator):
                     base_mat_name = ".".join(parts[:-1])
                     base_mat = materials.get(base_mat_name)
                     if base_mat:
-                        # Replace in all mesh data blocks (mesh-linked materials)
-                        for mesh in bpy.data.meshes:
-                            for idx, mat in enumerate(mesh.materials):
-                                if mat == material:
-                                    mesh.materials[idx] = base_mat
-                        # Replace in all object material slots (object-linked materials)
-                        for obj in bpy.data.objects:
-                            for slot in obj.material_slots:
-                                if slot.material == material:
-                                    slot.material = base_mat
+                        material.user_remap(base_mat)
                         materials.remove(material, do_unlink=True)
                     else:
                         material.name = base_mat_name
@@ -1039,6 +1374,19 @@ class MaterialImporter(bpy.types.Operator):
                 continue
                 
             textures = {}
+            scalars = {}
+            vectors = {}
+            mat_data = None
+            
+            def add_tex(k, v):
+                if not k or not v:
+                    return
+                k_lower = k.lower()
+                textures[k_lower] = v
+                k_norm = k_lower.replace(" ", "").replace("_", "").replace("-", "")
+                if k_norm not in textures:
+                    textures[k_norm] = v
+                    
             if mat_file.endswith('.json'):
                 try:
                     with open(mat_file, 'r', encoding='utf-8') as f:
@@ -1051,7 +1399,7 @@ class MaterialImporter(bpy.types.Operator):
                                 for k, v in data_item["Textures"].items():
                                     if isinstance(v, str):
                                         tex_name = v.split("'")[1] if "'" in v else v
-                                        textures[k.lower()] = tex_name.split('.')[0]
+                                        add_tex(k, tex_name.split('.')[0])
                                         
                             tp_vals = data_item.get("TextureParameterValues", [])
                             if isinstance(tp_vals, list):
@@ -1066,19 +1414,56 @@ class MaterialImporter(bpy.types.Operator):
                                                 obj_name = str(param_val)
                                             if obj_name:
                                                 tex_name = obj_name.split("'")[1] if "'" in obj_name else obj_name
-                                                textures[param_name.lower()] = tex_name.split('.')[0]
+                                                add_tex(param_name, tex_name.split('.')[0])
                                                 
+                            sp_vals = data_item.get("ScalarParameterValues", [])
+                            if isinstance(sp_vals, list):
+                                for sp in sp_vals:
+                                    if isinstance(sp, dict):
+                                        param_name = sp.get("ParameterInfo", {}).get("Name", "")
+                                        param_val = sp.get("ParameterValue")
+                                        if param_name and param_val is not None:
+                                            try:
+                                                scalars[param_name.lower()] = float(param_val)
+                                            except (ValueError, TypeError):
+                                                pass
+                                                
+                            vp_vals = data_item.get("VectorParameterValues", [])
+                            if isinstance(vp_vals, list):
+                                for vp in vp_vals:
+                                    if isinstance(vp, dict):
+                                        param_name = vp.get("ParameterInfo", {}).get("Name", "")
+                                        param_val = vp.get("ParameterValue")
+                                        if param_name and isinstance(param_val, dict):
+                                            vectors[param_name.lower()] = (
+                                                param_val.get("R", 0.0),
+                                                param_val.get("G", 0.0),
+                                                param_val.get("B", 0.0),
+                                                param_val.get("A", 1.0)
+                                            )
+                                            
                             for k, v in data_item.items():
-                                if k.lower() == "properties" and isinstance(v, dict):
-                                    extract_all_textures(v)
+                                k_lower = k.lower()
+                                if k_lower in ("textureparametervalues", "textures", "scalarparametervalues", "vectorparametervalues"):
                                     continue
-                                if isinstance(v, str):
+                                if isinstance(v, (int, float)):
+                                    scalars[k_lower] = float(v)
+                                elif isinstance(v, dict):
+                                    if any(x in v for x in ("R", "G", "B")):
+                                        vectors[k_lower] = (
+                                            v.get("R", 0.0),
+                                            v.get("G", 0.0),
+                                            v.get("B", 0.0),
+                                            v.get("A", 1.0)
+                                        )
+                                    else:
+                                        extract_all_textures(v)
+                                elif isinstance(v, str):
                                     if "/textures/" in v.lower() or "texture2d'" in v.lower():
                                         tex_name = v.split("'")[1] if "'" in v else v
-                                        textures[k.lower()] = tex_name.split('.')[0]
-                                elif isinstance(v, (dict, list)):
-                                    if k not in ("TextureParameterValues", "Textures"):
-                                        extract_all_textures(v)
+                                        add_tex(k, tex_name.split('.')[0])
+                                elif isinstance(v, list):
+                                    extract_all_textures(v)
                         elif isinstance(data_item, list):
                             for item in data_item:
                                 extract_all_textures(item)
@@ -1093,11 +1478,26 @@ class MaterialImporter(bpy.types.Operator):
                     for line in lines:
                         if '=' in line:
                             k, v = line.split('=', 1)
-                            textures[k.strip().lower()] = v.strip()
+                            k_clean = k.strip().lower()
+                            v_clean = v.strip()
+                            try:
+                                scalars[k_clean] = float(v_clean)
+                            except ValueError:
+                                add_tex(k_clean, v_clean)
                 except Exception as e:
                     print(f"Error parsing legacy mat file {mat_file}: {e}")
                     
-            if not textures:
+            if not textures and not scalars and not vectors:
+                continue
+                
+            # Check if Blender already has textures for this material
+            has_existing_textures = False
+            if material.use_nodes and material.node_tree:
+                has_existing_textures = any(node.type == 'TEX_IMAGE' for node in material.node_tree.nodes)
+                
+            # If the JSON has no textures, but Blender already has textures, preserve them!
+            if not textures and has_existing_textures:
+                print(f"Preserving existing textures for material: {mat_name}")
                 continue
                 
             # Extract Set A texture parameter mappings
@@ -1107,6 +1507,7 @@ class MaterialImporter(bpy.types.Operator):
             rough_tex = textures.get("roughness") or textures.get("rough") or textures.get("roughnesstex")
             metallic_tex = textures.get("metallic") or textures.get("metal") or textures.get("metallictex")
             mask_tex = textures.get("masks") or textures.get("mask") or textures.get("maskstex") or textures.get("mra") or textures.get("ormh") or textures.get("orm") or textures.get("pm_specularmasks") or textures.get("specularmasks")
+            emissive_tex = textures.get("emissive") or textures.get("emissivecolor") or textures.get("emissivetex") or textures.get("emissive_color") or textures.get("emissive_tex") or textures.get("pm_emissive")
             
             # Extract Set B texture parameter mappings (for Vertex-Color blended materials)
             diffuse_tex_b = textures.get("diffuse_b") or textures.get("basecolor_b") or textures.get("basecolor_2") or textures.get("basecolorcomponent_b") or textures.get("basecolortex_b") or textures.get("color_b") or textures.get("albedo_b") or textures.get("other[1]")
@@ -1124,6 +1525,7 @@ class MaterialImporter(bpy.types.Operator):
             rough_path = resolve_file_path(file_index, rough_tex, preferred_exts=img_exts) if rough_tex else None
             metallic_path = resolve_file_path(file_index, metallic_tex, preferred_exts=img_exts) if metallic_tex else None
             mask_path = resolve_file_path(file_index, mask_tex, preferred_exts=img_exts) if mask_tex else None
+            emissive_path = resolve_file_path(file_index, emissive_tex, preferred_exts=img_exts) if emissive_tex else None
             
             diffuse_path_b = resolve_file_path(file_index, diffuse_tex_b, preferred_exts=img_exts) if diffuse_tex_b else None
             normal_path_b = resolve_file_path(file_index, normal_tex_b, preferred_exts=img_exts) if normal_tex_b else None
@@ -1180,6 +1582,8 @@ class MaterialImporter(bpy.types.Operator):
                 socket = shader_node.inputs.get(socket_name)
                 if socket is None and socket_name == "Specular":
                     socket = shader_node.inputs.get("Specular IOR Level")
+                if socket is None and socket_name == "Emission Color":
+                    socket = shader_node.inputs.get("Emission")
                 if socket is not None:
                     material.node_tree.links.new(socket, tex_node.outputs[out_socket_name])
                     
@@ -1209,24 +1613,50 @@ class MaterialImporter(bpy.types.Operator):
                     material.node_tree.links.new(mix_node.inputs[a_in], diffuse_node_a.outputs["Color"])
                     material.node_tree.links.new(mix_node.inputs[b_in], diffuse_node_b.outputs["Color"])
                     material.node_tree.links.new(shader_node.inputs["Base Color"], mix_node.outputs[out_res])
-                    link_socket(diffuse_node_a, "Alpha", "Alpha")
+                    
+                    if is_material_transparent(mat_name, mat_data):
+                        link_socket(diffuse_node_a, "Alpha", "Alpha")
+                        try:
+                            material.blend_method = 'HASHED'
+                        except (AttributeError, TypeError):
+                            pass
+                        try:
+                            material.shadow_method = 'HASHED'
+                        except (AttributeError, TypeError):
+                            pass
+                        if hasattr(material, "surface_render_method"):
+                            try:
+                                material.surface_render_method = 'DITHERED'
+                            except Exception:
+                                pass
                 else:
                     # Single diffuse color setup
                     link_socket(diffuse_node_a, "Base Color")
-                    link_socket(diffuse_node_a, "Alpha", "Alpha")
-                try:
-                    material.blend_method = 'HASHED'
-                except (AttributeError, TypeError):
-                    pass
-                try:
-                    material.shadow_method = 'HASHED'
-                except (AttributeError, TypeError):
-                    pass
-                if hasattr(material, "surface_render_method"):
-                    try:
-                        material.surface_render_method = 'DITHERED'
-                    except Exception:
-                        pass
+                    
+                    if is_material_transparent(mat_name, mat_data):
+                        link_socket(diffuse_node_a, "Alpha", "Alpha")
+                        try:
+                            material.blend_method = 'HASHED'
+                        except (AttributeError, TypeError):
+                            pass
+                        try:
+                            material.shadow_method = 'HASHED'
+                        except (AttributeError, TypeError):
+                            pass
+                        if hasattr(material, "surface_render_method"):
+                            try:
+                                material.surface_render_method = 'DITHERED'
+                            except Exception:
+                                pass
+            else:
+                # No diffuse texture: set solid color if present in vectors
+                base_color = (0.8, 0.8, 0.8, 1.0)
+                for k, val in vectors.items():
+                    k_norm = k.replace(" ", "").replace("_", "").replace("-", "")
+                    if k_norm in ("colour", "color", "basecolor", "diffuse", "diffusecolor", "tint"):
+                        base_color = (val[0], val[1], val[2], 1.0)
+                        break
+                shader_node.inputs["Base Color"].default_value = base_color
                 
             # 2. Normal Mapping Setup (with Green-channel inversion)
             normal_node_a = load_texture_node(normal_path, "Non-Color")
@@ -1297,7 +1727,14 @@ class MaterialImporter(bpy.types.Operator):
                     material.node_tree.links.new(shader_node.inputs["Roughness"], mix_node.outputs[out_res])
                 else:
                     link_socket(rough_node_a, "Roughness")
-                    
+            else:
+                # Set solid Roughness from scalars
+                for k, val in scalars.items():
+                    k_norm = k.replace(" ", "").replace("_", "").replace("-", "")
+                    if k_norm in ("roughness", "rough"):
+                        shader_node.inputs["Roughness"].default_value = max(0.0, min(1.0, val))
+                        break
+                        
             # 5. Metallic Setup
             metallic_node_a = load_texture_node(metallic_path, "Non-Color")
             metallic_node_b = load_texture_node(metallic_path_b, "Non-Color")
@@ -1311,6 +1748,13 @@ class MaterialImporter(bpy.types.Operator):
                     material.node_tree.links.new(shader_node.inputs["Metallic"], mix_node.outputs[out_res])
                 else:
                     link_socket(metallic_node_a, "Metallic")
+            else:
+                # Set solid Metallic from scalars
+                for k, val in scalars.items():
+                    k_norm = k.replace(" ", "").replace("_", "").replace("-", "")
+                    if k_norm in ("metallic", "metal"):
+                        shader_node.inputs["Metallic"].default_value = max(0.0, min(1.0, val))
+                        break
                     
             # 6. MRA packed mask setup (R=AO, G=Roughness, B=Metallic)
             mask_node_a = load_texture_node(mask_path, "Non-Color") if (mask_path and not rough_path and not metallic_path) else None
@@ -1348,6 +1792,37 @@ class MaterialImporter(bpy.types.Operator):
                     r_out, b_out = setup_mask_links(mask_node_a)
                     material.node_tree.links.new(shader_node.inputs["Roughness"], r_out)
                     material.node_tree.links.new(shader_node.inputs["Metallic"], b_out)
+                    
+            # 7. Emissive Shading Setup
+            emissive_strength = 1.0
+            for k, val in scalars.items():
+                if k in ("emissivemult", "emissivestrength", "emissive_multiplier", "emissive_strength", "emissive multiplier", "emissive strength"):
+                    emissive_strength = val
+                    break
+                    
+            emissive_color = None
+            for k, val in vectors.items():
+                if k in ("emissive", "emissivecolor", "emissive_color", "emissive color"):
+                    emissive_color = val
+                    break
+                    
+            emissive_node = load_texture_node(emissive_path, "sRGB")
+            emission_socket_name = "Emission Color"
+            emission_socket = shader_node.inputs.get(emission_socket_name)
+            if emission_socket is None:
+                emission_socket = shader_node.inputs.get("Emission")
+                
+            if emissive_node:
+                link_socket(emissive_node, "Emission Color")
+                strength_socket = shader_node.inputs.get("Emission Strength")
+                if strength_socket is not None:
+                    strength_socket.default_value = emissive_strength
+            elif emissive_color:
+                if emission_socket is not None:
+                    emission_socket.default_value = (emissive_color[0], emissive_color[1], emissive_color[2], 1.0)
+                strength_socket = shader_node.inputs.get("Emission Strength")
+                if strength_socket is not None:
+                    strength_socket.default_value = emissive_strength
                     
         print("Material configuration complete.")
         return {'FINISHED'}
