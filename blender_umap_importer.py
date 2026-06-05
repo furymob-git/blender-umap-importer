@@ -20,22 +20,32 @@ def update_analysis(self, context):
     except Exception as e:
         print(f"Error in update_analysis: {e}")
 
+
 class LIS_ReferencedFolderItem(bpy.types.PropertyGroup):
     path: bpy.props.StringProperty()
     missing: bpy.props.IntProperty()
+    missing_meshes: bpy.props.IntProperty()
+    missing_materials: bpy.props.IntProperty()
     total: bpy.props.IntProperty()
 
 class LIS_UL_referenced_folders(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            icon_name = "FOLDER_REDIRECT" if item.missing > 0 else "FILE_FOLDER"
             if item.missing > 0:
-                row.label(text=f"{item.path} ({item.missing}/{item.total} missing)", icon=icon_name)
+                split = row.split(factor=0.75, align=True)
+                split.label(text=item.path, icon="FOLDER_REDIRECT")
+                badge_row = split.row(align=True)
+                badge_row.alignment = 'RIGHT'
+                if item.missing_meshes > 0:
+                    badge_row.label(text=str(item.missing_meshes), icon="MESH_DATA")
+                if item.missing_materials > 0:
+                    badge_row.label(text=str(item.missing_materials), icon="MATERIAL")
             else:
-                row.label(text=f"{item.path} ({item.total} assets)", icon=icon_name)
+                row.label(text=f"{item.path} ({item.total} assets)", icon="FILE_FOLDER")
         elif self.layout_type == 'GRID':
             pass
+
 
 class MISettings(bpy.types.PropertyGroup):
     json_file: bpy.props.StringProperty(
@@ -124,10 +134,10 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
         
         self.layout.prop(mytool, "json_file")
         self.layout.prop(mytool, "base_directory")
+        self.layout.prop(mytool, "disable_viewport_refresh")
         self.layout.prop(mytool, "hide_collisions")
         self.layout.prop(mytool, "skip_missing_assets")
         self.layout.prop(mytool, "skip_missing_materials")
-        self.layout.prop(mytool, "disable_viewport_refresh")
         
         row = self.layout.row()
         row.operator(MapImporter.bl_idname, text="Import Level")
@@ -151,8 +161,10 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
         if mytool.show_analysis:
             box.label(text=_analysis_results["status"], icon="INFO")
             
-            row = box.row()
+            row = box.row(align=True)
             row.prop(mytool, "analysis_depth", text="Folder Depth")
+            row.operator("lis.refresh_analysis", text="", icon="FILE_REFRESH")
+
             
             if _analysis_results["folders"]:
                 box.prop(mytool, "analysis_mode", expand=True)
@@ -173,6 +185,115 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS FOR FILE SEARCHING, TRANSFORMS & GEOMETRY
 # -----------------------------------------------------------------------------
+
+def is_basic_shape(ue_path):
+    """
+    Checks if a virtual Unreal Engine path represents a built-in basic shape mesh
+    (e.g., /Engine/BasicShapes/Cube).
+    """
+    if not ue_path:
+        return False
+    path_lower = ue_path.lower()
+    for name in ("cube", "sphere", "cylinder", "cone", "plane"):
+        if f"engine/basicshapes/{name}" in path_lower or path_lower.endswith(f"basicshapes/{name}"):
+            return True
+    return False
+
+def is_basic_shape_material(ue_path):
+    """
+    Checks if a virtual Unreal Engine path represents the built-in basic shape material
+    (e.g., /Engine/BasicShapes/BasicShapeMaterial).
+    """
+    if not ue_path:
+        return False
+    path_lower = ue_path.lower()
+    return "engine/basicshapes/basicshapematerial" in path_lower or path_lower.endswith("basicshapes/basicshapematerial")
+
+def create_basic_shape(ue_path, name, collection):
+    """
+    Auto-generates Unreal Engine basic shapes inside Blender using bmesh,
+    with proper pivots, scales, and UV coordinates matching Unreal defaults.
+    """
+    import bmesh
+    import math
+    
+    path_lower = ue_path.lower()
+    mesh = bpy.data.meshes.new(name=f"{name}_Mesh")
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+    
+    bm = bmesh.new()
+    
+    # 1. Geometry generation (dimensions in meters matching 100cm Unreal default basic shapes)
+    if "cube" in path_lower:
+        bmesh.ops.create_cube(bm, size=1.0)
+    elif "sphere" in path_lower:
+        bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=0.5)
+    elif "cylinder" in path_lower:
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=32, radius1=0.5, radius2=0.5, depth=1.0)
+    elif "cone" in path_lower:
+        # Pivot in Unreal is at the base of the cone, so we translate vertices up by 0.5m along Z
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=32, radius1=0.5, radius2=0.0, depth=1.0)
+        bmesh.ops.translate(bm, verts=bm.verts, vec=(0.0, 0.0, 0.5))
+    elif "plane" in path_lower:
+        bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=0.5)
+    else:
+        # Fallback to cube
+        bmesh.ops.create_cube(bm, size=1.0)
+        
+    bm.to_mesh(mesh)
+    bm.free()
+    
+    # 2. UV mapping generation (so materials map correctly)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    
+    if "cube" in path_lower:
+        # Map each face loops to full 0..1 coordinates
+        for face in mesh.polygons:
+            uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+            for idx, loop_idx in enumerate(face.loop_indices):
+                uv_layer.data[loop_idx].uv = uvs[idx % 4]
+    elif "plane" in path_lower:
+        # Plane projection: Map vertices from [-0.5, 0.5] range to [0.0, 1.0] UVs
+        for loop in mesh.loops:
+            vco = mesh.vertices[loop.vertex_index].co
+            uv_layer.data[loop.index].uv = (vco.x + 0.5, vco.y + 0.5)
+    elif "sphere" in path_lower:
+        # Spherical projection
+        for loop in mesh.loops:
+            vco = mesh.vertices[loop.vertex_index].co.normalized()
+            u = 0.5 + math.atan2(vco.y, vco.x) / (2.0 * math.pi)
+            v_val = 0.5 + math.asin(vco.z) / math.pi
+            uv_layer.data[loop.index].uv = (u, v_val)
+    elif "cylinder" in path_lower or "cone" in path_lower:
+        # Cylindrical projection for sides, planar for caps
+        for face in mesh.polygons:
+            is_cap = abs(face.normal.z) > 0.9
+            for loop_idx in face.loop_indices:
+                vco = mesh.vertices[mesh.loops[loop_idx].vertex_index].co
+                if is_cap:
+                    uv_layer.data[loop_idx].uv = (vco.x + 0.5, vco.y + 0.5)
+                else:
+                    u = 0.5 + math.atan2(vco.y, vco.x) / (2.0 * math.pi)
+                    v_val = vco.z + 0.5 if "cylinder" in path_lower else vco.z  # Z goes 0 to 1 for cone after translation
+                    uv_layer.data[loop_idx].uv = (u, v_val)
+                    
+    mesh.update()
+    
+    # 3. Assign default BasicShapeMaterial
+    mat_name = "BasicShapeMaterial"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        shader = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if shader:
+            shader.inputs["Base Color"].default_value = (0.5, 0.5, 0.5, 1.0)
+            shader.inputs["Roughness"].default_value = 0.5
+    obj.data.materials.append(mat)
+    
+    return obj
 
 def is_collision_mesh(name):
     """
@@ -288,6 +409,65 @@ def _resolve_file_path_internal(index, ue_path, preferred_exts=None):
     return None
 
 _blueprint_mesh_cache = {}
+_blueprint_properties_cache = {}
+
+def resolve_blueprint_properties(index, template_path):
+    """
+    Loads and parses a blueprint class template JSON to find the properties
+    of the component corresponding to template_path.
+    """
+    if not template_path:
+        return {}
+        
+    global _blueprint_properties_cache
+    if template_path in _blueprint_properties_cache:
+        return _blueprint_properties_cache[template_path]
+        
+    parts = template_path.split('.')
+    bp_path = parts[0]
+    try:
+        suffix_idx = int(parts[-1])
+    except ValueError:
+        suffix_idx = None
+        
+    bp_json_path = resolve_file_path(index, bp_path, preferred_exts={'.json'})
+    if not bp_json_path or not os.path.exists(bp_json_path):
+        _blueprint_properties_cache[template_path] = {}
+        return {}
+        
+    try:
+        with open(bp_json_path, 'r', encoding='utf-8') as f:
+            bp_data = json.load(f)
+            
+        if not isinstance(bp_data, list):
+            bp_data = [bp_data]
+            
+        obj = None
+        if suffix_idx is not None and suffix_idx < len(bp_data):
+            obj = bp_data[suffix_idx]
+        else:
+            # Fallback: search by name
+            obj_name = template_path.split(':')[-1] if ':' in template_path else parts[-1]
+            for item in bp_data:
+                if isinstance(item, dict) and item.get("Name") == obj_name:
+                    obj = item
+                    break
+            if not obj:
+                # If still not found, check if ObjectName is inside the Name
+                for item in bp_data:
+                    if isinstance(item, dict) and obj_name in item.get("Name", ""):
+                        obj = item
+                        break
+                        
+        if obj and isinstance(obj, dict):
+            props = obj.get("Properties", {})
+            _blueprint_properties_cache[template_path] = props
+            return props
+    except Exception as e:
+        print(f"Error parsing blueprint template properties for {bp_json_path}: {e}")
+        
+    _blueprint_properties_cache[template_path] = {}
+    return {}
 
 def resolve_blueprint_mesh(index, template_path):
     """
@@ -301,47 +481,36 @@ def resolve_blueprint_mesh(index, template_path):
     if template_path in _blueprint_mesh_cache:
         return _blueprint_mesh_cache[template_path]
         
+    props = resolve_blueprint_properties(index, template_path)
+    if props:
+        sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
+        if sm_ref and isinstance(sm_ref, dict):
+            res = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
+            _blueprint_mesh_cache[template_path] = res
+            return res
+            
+    # Fallback: search for first object with a StaticMesh or SkeletalMesh property
+    # in the whole blueprint data list
     parts = template_path.split('.')
     bp_path = parts[0]
-    try:
-        suffix_idx = int(parts[-1])
-    except ValueError:
-        suffix_idx = None
-        
     bp_json_path = resolve_file_path(index, bp_path, preferred_exts={'.json'})
-    if not bp_json_path or not os.path.exists(bp_json_path):
-        _blueprint_mesh_cache[template_path] = None
-        return None
-        
-    try:
-        with open(bp_json_path, 'r', encoding='utf-8') as f:
-            bp_data = json.load(f)
-            
-        if not isinstance(bp_data, list):
-            bp_data = [bp_data]
-            
-        obj = None
-        if suffix_idx is not None and suffix_idx < len(bp_data):
-            obj = bp_data[suffix_idx]
-        else:
-            # Fallback: search for first object with a StaticMesh or SkeletalMesh property
+    if bp_json_path and os.path.exists(bp_json_path):
+        try:
+            with open(bp_json_path, 'r', encoding='utf-8') as f:
+                bp_data = json.load(f)
+            if not isinstance(bp_data, list):
+                bp_data = [bp_data]
             for item in bp_data:
                 if isinstance(item, dict):
-                    props = item.get("Properties", {})
-                    if "StaticMesh" in props or "SkeletalMesh" in props:
-                        obj = item
-                        break
+                    p = item.get("Properties", {})
+                    sm_ref = p.get("StaticMesh") or p.get("SkeletalMesh")
+                    if sm_ref and isinstance(sm_ref, dict):
+                        res = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
+                        _blueprint_mesh_cache[template_path] = res
+                        return res
+        except Exception:
+            pass
             
-        if obj:
-            props = obj.get("Properties", {})
-            sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
-            if sm_ref and isinstance(sm_ref, dict):
-                res = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
-                _blueprint_mesh_cache[template_path] = res
-                return res
-    except Exception as e:
-        print(f"Error parsing blueprint template {bp_json_path}: {e}")
-        
     _blueprint_mesh_cache[template_path] = None
     return None
 
@@ -593,12 +762,16 @@ def run_asset_analysis(mytool):
                 folder = '/' + '/'.join(parts[:depth])
             
         if folder not in folders_data:
-            folders_data[folder] = {"missing": 0, "total": 0}
+            folders_data[folder] = {"missing": 0, "missing_meshes": 0, "missing_materials": 0, "total": 0}
             
         folders_data[folder]["total"] += 1
         
         found = False
-        if file_index:
+        if asset_type == "mesh" and is_basic_shape(ue_path):
+            found = True
+        elif asset_type == "material" and is_basic_shape_material(ue_path):
+            found = True
+        elif file_index:
             preferred = {'.gltf', '.glb', '.fbx', '.obj'} if asset_type == "mesh" else {'.json', '.mat'}
             found_path = resolve_file_path(file_index, clean_path, preferred_exts=preferred)
             if found_path:
@@ -606,6 +779,10 @@ def run_asset_analysis(mytool):
                 
         if not found:
             folders_data[folder]["missing"] += 1
+            if asset_type == "mesh":
+                folders_data[folder]["missing_meshes"] += 1
+            else:
+                folders_data[folder]["missing_materials"] += 1
             missing_count += 1
             
     folders_list = []
@@ -613,6 +790,8 @@ def run_asset_analysis(mytool):
         folders_list.append({
             "path": f_path,
             "missing": data["missing"],
+            "missing_meshes": data["missing_meshes"],
+            "missing_materials": data["missing_materials"],
             "total": data["total"]
         })
         
@@ -644,6 +823,8 @@ def run_asset_analysis(mytool):
         item = mytool.analysis_folders.add()
         item.path = f["path"]
         item.missing = f["missing"]
+        item.missing_meshes = f["missing_meshes"]
+        item.missing_materials = f["missing_materials"]
         item.total = f["total"]
 
 def get_blender_transform(loc_dict, rot_dict, scale_dict):
@@ -961,8 +1142,9 @@ class MapImporter(bpy.types.Operator):
 
     def import_generator(self, context):
         # Clear caches for a fresh import
-        global _blueprint_mesh_cache, _resolve_cache
+        global _blueprint_mesh_cache, _blueprint_properties_cache, _resolve_cache
         _blueprint_mesh_cache.clear()
+        _blueprint_properties_cache.clear()
         _resolve_cache.clear()
 
         scene = context.scene
@@ -1048,6 +1230,15 @@ class MapImporter(bpy.types.Operator):
                 
             props = entity.get("Properties", {})
             
+            # Resolve blueprint template properties if Template is present
+            template_ref = entity.get("Template")
+            if template_ref and file_index:
+                template_path = template_ref.get("ObjectPath")
+                if template_path:
+                    template_props = resolve_blueprint_properties(file_index, template_path)
+                    # Merge properties: template properties are overridden by instance properties
+                    props = {**template_props, **props}
+            
             if is_actor:
                 # Actors get represented as Blender Empties to group their components
                 label = entity.get("ActorLabel", ename)
@@ -1117,13 +1308,20 @@ class MapImporter(bpy.types.Operator):
                     if mesh_path in mesh_cache:
                         base_mesh = mesh_cache[mesh_path]
                     else:
-                        mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
-                        if mesh_file:
-                            base_mesh = import_asset(mesh_file, f"{ename}_Template", import_collection, hide_collisions)
+                        if is_basic_shape(mesh_path):
+                            base_mesh = create_basic_shape(mesh_path, f"{ename}_Template", import_collection)
                             if base_mesh:
                                 mesh_cache[mesh_path] = base_mesh
                                 base_mesh.hide_viewport = True
                                 base_mesh.hide_render = True
+                        else:
+                            mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
+                            if mesh_file:
+                                base_mesh = import_asset(mesh_file, f"{ename}_Template", import_collection, hide_collisions)
+                                if base_mesh:
+                                    mesh_cache[mesh_path] = base_mesh
+                                    base_mesh.hide_viewport = True
+                                    base_mesh.hide_render = True
                                 
                     if not base_mesh:
                         print(f"Asset file not found or failed to import for: {mesh_path}")
@@ -1149,11 +1347,30 @@ class MapImporter(bpy.types.Operator):
                     if mesh_path in mesh_cache:
                         mesh_obj = clone_hierarchy(mesh_cache[mesh_path], ename, import_collection, unhide=True, hide_collisions=hide_collisions)
                     else:
-                        mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
-                        if mesh_file:
-                            mesh_obj = import_asset(mesh_file, ename, import_collection, hide_collisions)
+                        if is_basic_shape(mesh_path):
+                            mesh_obj = create_basic_shape(mesh_path, ename, import_collection)
                             if mesh_obj:
                                 mesh_cache[mesh_path] = mesh_obj
+                                # Apply OverrideMaterials from props onto the generated shape
+                                override_mats = props.get("OverrideMaterials", [])
+                                if override_mats and mesh_obj.type == 'MESH':
+                                    mesh_obj.data.materials.clear()
+                                    for mat_ref in override_mats:
+                                        if mat_ref:
+                                            mat_path = mat_ref.get("ObjectPath") or mat_ref.get("ObjectName") or ""
+                                            mat_clean = mat_path.split("'")[1] if "'" in mat_path else mat_path
+                                            mat_clean = mat_clean.split(".")[0].split("/")[-1]
+                                            mat = bpy.data.materials.get(mat_clean)
+                                            if not mat:
+                                                mat = bpy.data.materials.new(name=mat_clean)
+                                                mat.use_nodes = True
+                                            mesh_obj.data.materials.append(mat)
+                        else:
+                            mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
+                            if mesh_file:
+                                mesh_obj = import_asset(mesh_file, ename, import_collection, hide_collisions)
+                                if mesh_obj:
+                                    mesh_cache[mesh_path] = mesh_obj
                                 
                     if mesh_obj:
                         blender_objs[i] = mesh_obj
@@ -1272,6 +1489,10 @@ class MapImporter(bpy.types.Operator):
             mytool.import_progress = 97.0
             yield False
             
+            # Temporarily hide all decals to prevent raycast self-intersection
+            for decal_obj, _ in decal_objs:
+                decal_obj.hide_viewport = True
+            
             # Temporarily show the collection so Blender can build the dependency graph for raycasting
             if import_collection:
                 import_collection.hide_viewport = False
@@ -1296,8 +1517,7 @@ class MapImporter(bpy.types.Operator):
                     success, hit_loc, hit_norm, hit_index, hit_obj, hit_matrix = context.scene.ray_cast(
                         depsgraph, ray_origin, ray_direction, distance=depth
                     )
-                    
-                    if success and hit_obj and hit_obj != decal_obj and hit_obj.type == 'MESH':
+                    if success and hit_obj and hit_obj.type == 'MESH':
                         # Ignore other decals or physical collisions
                         if "decal" not in hit_obj.name.lower() and not is_collision_mesh(hit_obj.name):
                             # Add a Shrinkwrap modifier to snap the decal mesh to the wall
@@ -1314,6 +1534,10 @@ class MapImporter(bpy.types.Operator):
                             mod.offset = 0.0015  # 1.5mm offset to prevent Z-fighting
                 except Exception as e:
                     print(f"Error projecting decal {decal_obj.name}: {e}")
+            
+            # Restore visibility for all decals
+            for decal_obj, _ in decal_objs:
+                decal_obj.hide_viewport = False
             
             # Hide the collection again if disable_viewport_refresh was active
             if mytool.disable_viewport_refresh and import_collection:
@@ -1370,8 +1594,38 @@ class MaterialImporter(bpy.types.Operator):
                 
             mat_file = resolve_file_path(file_index, mat_name, preferred_exts={'.json', '.mat'})
             if not mat_file:
-                print(f"Material file not found for: {mat_name}")
-                continue
+                if mat_name.lower() == "basicshapematerial":
+                    # Build a procedural checker grid material
+                    material.use_nodes = True
+                    nodes = material.node_tree.nodes
+                    links = material.node_tree.links
+                    for node in list(nodes):
+                        if node.type != 'OUTPUT_MATERIAL':
+                            nodes.remove(node)
+                            
+                    material_output = nodes.get("Material Output")
+                    if not material_output:
+                        material_output = nodes.new(type="ShaderNodeOutputMaterial")
+                        
+                    shader_node = nodes.new(type="ShaderNodeBsdfPrincipled")
+                    links.new(material_output.inputs["Surface"], shader_node.outputs["BSDF"])
+                    
+                    # Add Checker Texture
+                    checker = nodes.new(type="ShaderNodeTexChecker")
+                    checker.inputs["Color1"].default_value = (0.4, 0.4, 0.4, 1.0) # Dark grey
+                    checker.inputs["Color2"].default_value = (0.5, 0.5, 0.5, 1.0) # Light grey
+                    checker.inputs["Scale"].default_value = 10.0 # Scale of checker grid
+                    
+                    # Connect Checker Color to Principled Base Color
+                    links.new(shader_node.inputs["Base Color"], checker.outputs["Color"])
+                    
+                    # Set standard roughness
+                    shader_node.inputs["Roughness"].default_value = 0.5
+                    print("Generated default procedural grid for BasicShapeMaterial")
+                    continue
+                else:
+                    print(f"Material file not found for: {mat_name}")
+                    continue
                 
             textures = {}
             scalars = {}
@@ -1867,7 +2121,11 @@ class ExportMissingAssetsListOperator(bpy.types.Operator):
                 for asset_type, ue_path in sorted(referenced_assets, key=lambda x: x[1]):
                     clean_path = clean_unreal_path(ue_path)
                     found = False
-                    if file_index:
+                    if asset_type == "mesh" and is_basic_shape(ue_path):
+                        found = True
+                    elif asset_type == "material" and is_basic_shape_material(ue_path):
+                        found = True
+                    elif file_index:
                         preferred = {'.gltf', '.glb', '.fbx', '.obj'} if asset_type == "mesh" else {'.json', '.mat'}
                         found_path = resolve_file_path(file_index, clean_path, preferred_exts=preferred)
                         if found_path:
@@ -1914,6 +2172,27 @@ class ExportMissingAssetsListOperator(bpy.types.Operator):
             self.report({'ERROR'}, f"Failed to save report: {e}")
             return {'CANCELLED'}
 
+class RefreshAnalysisOperator(bpy.types.Operator):
+    bl_idname = "lis.refresh_analysis"
+    bl_label = "Refresh Asset Analysis"
+    bl_description = "Rescan the asset directory and refresh the missing assets list"
+
+    def execute(self, context):
+        mytool = context.scene.my_tool
+        base_dir = mytool.base_directory
+        if base_dir:
+            norm_dir = os.path.abspath(base_dir).lower()
+            global _index_cache, _resolve_cache
+            if norm_dir in _index_cache:
+                del _index_cache[norm_dir]
+            _resolve_cache.clear()
+        try:
+            run_asset_analysis(mytool)
+            self.report({'INFO'}, "Asset analysis refreshed.")
+        except Exception as e:
+            self.report({'ERROR'}, f"Refresh failed: {e}")
+        return {'FINISHED'}
+
 classes = (
     LIS_ReferencedFolderItem,
     LIS_UL_referenced_folders,
@@ -1922,6 +2201,7 @@ classes = (
     MapImporter,
     MaterialImporter,
     ExportMissingAssetsListOperator,
+    RefreshAnalysisOperator,
 )
 
 def register():
