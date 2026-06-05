@@ -26,6 +26,8 @@ class LIS_ReferencedFolderItem(bpy.types.PropertyGroup):
     missing: bpy.props.IntProperty()
     missing_meshes: bpy.props.IntProperty()
     missing_materials: bpy.props.IntProperty()
+    missing_mesh_names: bpy.props.StringProperty()      # newline-separated, max 15
+    missing_material_names: bpy.props.StringProperty()  # newline-separated, max 15
     total: bpy.props.IntProperty()
 
 class LIS_UL_referenced_folders(bpy.types.UIList):
@@ -38,14 +40,36 @@ class LIS_UL_referenced_folders(bpy.types.UIList):
                 badge_row = split.row(align=True)
                 badge_row.alignment = 'RIGHT'
                 if item.missing_meshes > 0:
-                    badge_row.label(text=str(item.missing_meshes), icon="MESH_DATA")
+                    op = badge_row.operator("lis.show_missing_info", text=str(item.missing_meshes), icon="MESH_DATA", emboss=False)
+                    op.names = item.missing_mesh_names
+                    op.label = f"{item.missing_meshes} missing mesh(es)"
                 if item.missing_materials > 0:
-                    badge_row.label(text=str(item.missing_materials), icon="MATERIAL")
+                    op = badge_row.operator("lis.show_missing_info", text=str(item.missing_materials), icon="MATERIAL", emboss=False)
+                    op.names = item.missing_material_names
+                    op.label = f"{item.missing_materials} missing material(s)"
             else:
                 row.label(text=f"{item.path} ({item.total} assets)", icon="FILE_FOLDER")
         elif self.layout_type == 'GRID':
             pass
 
+
+class ShowMissingInfoOperator(bpy.types.Operator):
+    bl_idname = "lis.show_missing_info"
+    bl_label = ""
+    bl_description = ""
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    names: bpy.props.StringProperty(default="")
+    label: bpy.props.StringProperty(default="")
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.names:
+            return f"{properties.label}:\n{properties.names}"
+        return properties.label
+
+    def execute(self, context):
+        return {'CANCELLED'}  # No-op, tooltip-only
 
 class MISettings(bpy.types.PropertyGroup):
     json_file: bpy.props.StringProperty(
@@ -762,7 +786,8 @@ def run_asset_analysis(mytool):
                 folder = '/' + '/'.join(parts[:depth])
             
         if folder not in folders_data:
-            folders_data[folder] = {"missing": 0, "missing_meshes": 0, "missing_materials": 0, "total": 0}
+            folders_data[folder] = {"missing": 0, "missing_meshes": 0, "missing_materials": 0,
+                                    "missing_mesh_names": [], "missing_material_names": [], "total": 0}
             
         folders_data[folder]["total"] += 1
         
@@ -779,19 +804,31 @@ def run_asset_analysis(mytool):
                 
         if not found:
             folders_data[folder]["missing"] += 1
+            asset_name = parts[-1] if parts else clean_path
             if asset_type == "mesh":
                 folders_data[folder]["missing_meshes"] += 1
+                folders_data[folder]["missing_mesh_names"].append(asset_name)
             else:
                 folders_data[folder]["missing_materials"] += 1
+                folders_data[folder]["missing_material_names"].append(asset_name)
             missing_count += 1
             
     folders_list = []
     for f_path, data in folders_data.items():
+        # Cap names at 15 entries for tooltip readability
+        mesh_names = data["missing_mesh_names"][:15]
+        mat_names = data["missing_material_names"][:15]
+        if len(data["missing_mesh_names"]) > 15:
+            mesh_names.append(f"... and {len(data['missing_mesh_names']) - 15} more")
+        if len(data["missing_material_names"]) > 15:
+            mat_names.append(f"... and {len(data['missing_material_names']) - 15} more")
         folders_list.append({
             "path": f_path,
             "missing": data["missing"],
             "missing_meshes": data["missing_meshes"],
             "missing_materials": data["missing_materials"],
+            "missing_mesh_names": "\n".join(mesh_names),
+            "missing_material_names": "\n".join(mat_names),
             "total": data["total"]
         })
         
@@ -825,7 +862,10 @@ def run_asset_analysis(mytool):
         item.missing = f["missing"]
         item.missing_meshes = f["missing_meshes"]
         item.missing_materials = f["missing_materials"]
+        item.missing_mesh_names = f["missing_mesh_names"]
+        item.missing_material_names = f["missing_material_names"]
         item.total = f["total"]
+
 
 def get_blender_transform(loc_dict, rot_dict, scale_dict):
     """
@@ -2196,6 +2236,7 @@ class RefreshAnalysisOperator(bpy.types.Operator):
 classes = (
     LIS_ReferencedFolderItem,
     LIS_UL_referenced_folders,
+    ShowMissingInfoOperator,
     MISettings,
     VIEW3D_PT_map_importer_panel,
     MapImporter,
