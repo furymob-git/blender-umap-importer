@@ -407,6 +407,28 @@ def resolve_file_path(index, ue_path, preferred_exts=None):
     _resolve_cache[cache_key] = res
     return res
 
+def is_safe_fallback(req, cand):
+    req_lower = req.lower()
+    cand_lower = cand.lower()
+    
+    # 1. If requested looks like a normal map, candidate must look like a normal map
+    is_req_normal = any(x in req_lower for x in ("normal", "_n.", "_n_", "_n'"))
+    is_cand_normal = any(x in cand_lower for x in ("normal", "_n.", "_n_", "_n'"))
+    if is_req_normal != is_cand_normal:
+        return False
+        
+    # 2. If requested looks like a diffuse/color map, candidate must not look like a normal map
+    is_req_diffuse = any(x in req_lower for x in ("diffuse", "basecolor", "albedo", "color", "_d.", "_d_", "_bc."))
+    if is_req_diffuse and is_cand_normal:
+        return False
+        
+    # 3. If requested looks like a mask map, candidate must not look like a normal or diffuse map
+    is_req_mask = any(x in req_lower for x in ("mask", "orm", "srm", "mra"))
+    if is_req_mask and (is_cand_normal or is_req_diffuse):
+        return False
+        
+    return True
+
 def _resolve_file_path_internal(index, ue_path, preferred_exts=None):
     """
     Resolves an Unreal virtual asset path to a physical path on disk using
@@ -490,21 +512,24 @@ def _resolve_file_path_internal(index, ue_path, preferred_exts=None):
         while idx < len(sorted_keys):
             key = sorted_keys[idx]
             if key.startswith(base):
-                candidates.extend(index[key])
+                candidates.extend(index.get(key, []))
                 idx += 1
             else:
                 break
                 
         if candidates:
-            candidates.sort()  # Sort alphabetically to be deterministic and pick the lowest/first variant
-            if preferred_exts:
-                filtered = [c for c in candidates if os.path.splitext(c)[1].lower() in preferred_exts]
-                if filtered:
-                    print(f"Warning: Exact asset '{ue_path}' not found. Using smart fallback ({desc}): '{os.path.basename(filtered[0])}'")
-                    return filtered[0]
-            fallback_path = candidates[0]
-            print(f"Warning: Exact asset '{ue_path}' not found. Using smart fallback ({desc}): '{os.path.basename(fallback_path)}'")
-            return fallback_path
+            # Filter candidates using is_safe_fallback to avoid cross-type mismatches
+            safe_candidates = [c for c in candidates if is_safe_fallback(filename, os.path.basename(c))]
+            if safe_candidates:
+                safe_candidates.sort()  # Sort alphabetically to be deterministic and pick the lowest/first variant
+                if preferred_exts:
+                    filtered = [c for c in safe_candidates if os.path.splitext(c)[1].lower() in preferred_exts]
+                    if filtered:
+                        print(f"Warning: Exact asset '{ue_path}' not found. Using smart fallback ({desc}): '{os.path.basename(filtered[0])}'")
+                        return filtered[0]
+                fallback_path = safe_candidates[0]
+                print(f"Warning: Exact asset '{ue_path}' not found. Using smart fallback ({desc}): '{os.path.basename(fallback_path)}'")
+                return fallback_path
 
     return None
 
@@ -1702,54 +1727,21 @@ class MaterialImporter(bpy.types.Operator):
                     else:
                         material.name = base_mat_name
                     
-        # Material rebuilds
-        print("Configuring material shaders...")
-        for material in list(materials):
-            mat_name = material.name
-            
-            if 'WorldGridMaterial' in mat_name:
-                continue
-                
-            mat_file = resolve_file_path(file_index, mat_name, preferred_exts={'.json', '.mat'})
-            if not mat_file:
-                if mat_name.lower() == "basicshapematerial":
-                    # Build a procedural checker grid material
-                    material.use_nodes = True
-                    nodes = material.node_tree.nodes
-                    links = material.node_tree.links
-                    for node in list(nodes):
-                        if node.type != 'OUTPUT_MATERIAL':
-                            nodes.remove(node)
-                            
-                    material_output = nodes.get("Material Output")
-                    if not material_output:
-                        material_output = nodes.new(type="ShaderNodeOutputMaterial")
-                        
-                    shader_node = nodes.new(type="ShaderNodeBsdfPrincipled")
-                    links.new(material_output.inputs["Surface"], shader_node.outputs["BSDF"])
-                    
-                    # Add Checker Texture
-                    checker = nodes.new(type="ShaderNodeTexChecker")
-                    checker.inputs["Color1"].default_value = (0.4, 0.4, 0.4, 1.0) # Dark grey
-                    checker.inputs["Color2"].default_value = (0.5, 0.5, 0.5, 1.0) # Light grey
-                    checker.inputs["Scale"].default_value = 10.0 # Scale of checker grid
-                    
-                    # Connect Checker Color to Principled Base Color
-                    links.new(shader_node.inputs["Base Color"], checker.outputs["Color"])
-                    
-                    # Set standard roughness
-                    shader_node.inputs["Roughness"].default_value = 0.5
-                    print("Generated default procedural grid for BasicShapeMaterial")
-                    continue
-                else:
-                    print(f"Material file not found for: {mat_name}")
-                    continue
-                
+        material_data_cache = {}
+
+        def load_material_data(file_path, depth=0):
+            if not file_path or not os.path.exists(file_path):
+                return {}, {}, {}, None
+
+            if file_path in material_data_cache:
+                tex, scal, vec, mdata = material_data_cache[file_path]
+                return dict(tex), dict(scal), dict(vec), mdata
+
             textures = {}
             scalars = {}
             vectors = {}
-            mat_data = None
-            
+            main_mat_data = []
+
             def add_tex(k, v):
                 if not k or not v:
                     return
@@ -1758,15 +1750,19 @@ class MaterialImporter(bpy.types.Operator):
                 k_norm = k_lower.replace(" ", "").replace("_", "").replace("-", "")
                 if k_norm not in textures:
                     textures[k_norm] = v
-                    
-            if mat_file.endswith('.json'):
+
+            if file_path.endswith('.json'):
                 try:
-                    with open(mat_file, 'r', encoding='utf-8') as f:
+                    with open(file_path, 'r', encoding='utf-8') as f:
                         mat_data = json.load(f)
-                        
-                    def extract_all_textures(data_item):
+                    
+                    if isinstance(mat_data, list):
+                        main_mat_data.extend(mat_data)
+                    elif isinstance(mat_data, dict):
+                        main_mat_data.append(mat_data)
+
+                    def extract_local_params(data_item):
                         if isinstance(data_item, dict):
-                            # Clean up period extensions inside Unreal names
                             if "Textures" in data_item and isinstance(data_item["Textures"], dict):
                                 for k, v in data_item["Textures"].items():
                                     if isinstance(v, str):
@@ -1816,7 +1812,7 @@ class MaterialImporter(bpy.types.Operator):
                                             
                             for k, v in data_item.items():
                                 k_lower = k.lower()
-                                if k_lower in ("textureparametervalues", "textures", "scalarparametervalues", "vectorparametervalues"):
+                                if k_lower in ("textureparametervalues", "textures", "scalarparametervalues", "vectorparametervalues", "cachedexpressiondata"):
                                     continue
                                 if isinstance(v, (int, float)):
                                     scalars[k_lower] = float(v)
@@ -1829,23 +1825,95 @@ class MaterialImporter(bpy.types.Operator):
                                             v.get("A", 1.0)
                                         )
                                     else:
-                                        extract_all_textures(v)
+                                        extract_local_params(v)
                                 elif isinstance(v, str):
                                     if "/textures/" in v.lower() or "texture2d'" in v.lower():
                                         tex_name = v.split("'")[1] if "'" in v else v
                                         add_tex(k, tex_name.split('.')[0])
                                 elif isinstance(v, list):
-                                    extract_all_textures(v)
+                                    extract_local_params(v)
+
+                            cached = data_item.get("CachedExpressionData")
+                            if isinstance(cached, dict):
+                                runtime_scalars = cached.get("RuntimeEntries") or cached.get("RuntimeEntries[0]")
+                                if isinstance(runtime_scalars, dict):
+                                    p_info = runtime_scalars.get("ParameterInfoSet", [])
+                                    scalar_vals = cached.get("ScalarValues", [])
+                                    for idx, p in enumerate(p_info):
+                                        if idx < len(scalar_vals):
+                                            name = p.get("Name")
+                                            if name:
+                                                scalars[name.lower()] = float(scalar_vals[idx])
+                                
+                                runtime_vectors = cached.get("RuntimeEntries[1]")
+                                if isinstance(runtime_vectors, dict):
+                                    p_info = runtime_vectors.get("ParameterInfoSet", [])
+                                    vector_vals = cached.get("VectorValues", [])
+                                    for idx, p in enumerate(p_info):
+                                        if idx < len(vector_vals):
+                                            name = p.get("Name")
+                                            val = vector_vals[idx]
+                                            if name and isinstance(val, dict):
+                                                vectors[name.lower()] = (
+                                                    val.get("R", 0.0),
+                                                    val.get("G", 0.0),
+                                                    val.get("B", 0.0),
+                                                    val.get("A", 1.0)
+                                                )
+                                                
+                                runtime_textures = cached.get("RuntimeEntries[3]")
+                                if isinstance(runtime_textures, dict):
+                                    p_info = runtime_textures.get("ParameterInfoSet", [])
+                                    tex_vals = cached.get("TextureValues", [])
+                                    for idx, p in enumerate(p_info):
+                                        if idx < len(tex_vals):
+                                            name = p.get("Name")
+                                            val = tex_vals[idx]
+                                            if name and isinstance(val, dict):
+                                                asset_path = val.get("AssetPathName")
+                                                if asset_path:
+                                                    tex_name = asset_path.split("'")[1] if "'" in asset_path else asset_path
+                                                    add_tex(name, tex_name.split('.')[0])
                         elif isinstance(data_item, list):
                             for item in data_item:
-                                extract_all_textures(item)
+                                extract_local_params(item)
                                 
-                    extract_all_textures(mat_data)
+                    extract_local_params(mat_data)
+                    
+                    parent_ref = None
+                    if isinstance(mat_data, list):
+                        for item in mat_data:
+                            if isinstance(item, dict):
+                                props = item.get("Properties", {})
+                                if "Parent" in props:
+                                    parent_ref = props["Parent"]
+                                    break
+                    elif isinstance(mat_data, dict):
+                        props = mat_data.get("Properties", {})
+                        if "Parent" in props:
+                            parent_ref = props["Parent"]
+                            
+                    if parent_ref and depth < 5:
+                        parent_path_raw = parent_ref.get("ObjectPath") or parent_ref.get("ObjectName")
+                        clean_parent_path = clean_unreal_path(parent_path_raw)
+                        if clean_parent_path:
+                            parent_file = resolve_file_path(file_index, clean_parent_path, preferred_exts={'.json', '.mat'})
+                            if parent_file:
+                                parent_tex, parent_scalars, parent_vectors, parent_mdata = load_material_data(parent_file, depth + 1)
+                                parent_tex.update(textures)
+                                textures = parent_tex
+                                parent_scalars.update(scalars)
+                                scalars = parent_scalars
+                                parent_vectors.update(vectors)
+                                vectors = parent_vectors
+                                if parent_mdata:
+                                    main_mat_data.extend(parent_mdata)
+                                
                 except Exception as e:
-                    print(f"Error parsing material JSON {mat_file}: {e}")
+                    print(f"Error parsing material JSON {file_path}: {e}")
             else:
                 try:
-                    with open(mat_file, 'r', encoding='utf-8') as f:
+                    with open(file_path, 'r', encoding='utf-8') as f:
                         lines = f.readlines()
                     for line in lines:
                         if '=' in line:
@@ -1857,7 +1925,55 @@ class MaterialImporter(bpy.types.Operator):
                             except ValueError:
                                 add_tex(k_clean, v_clean)
                 except Exception as e:
-                    print(f"Error parsing legacy mat file {mat_file}: {e}")
+                    print(f"Error parsing legacy mat file {file_path}: {e}")
+
+            material_data_cache[file_path] = (dict(textures), dict(scalars), dict(vectors), main_mat_data)
+            return textures, scalars, vectors, main_mat_data
+
+        # Material rebuilds
+        print("Configuring material shaders...")
+        for material in list(materials):
+            mat_name = material.name
+            
+            if 'WorldGridMaterial' in mat_name:
+                continue
+                
+            mat_file = resolve_file_path(file_index, mat_name, preferred_exts={'.json', '.mat'})
+            if not mat_file:
+                if mat_name.lower() == "basicshapematerial":
+                    # Build a procedural checker grid material
+                    material.use_nodes = True
+                    nodes = material.node_tree.nodes
+                    links = material.node_tree.links
+                    for node in list(nodes):
+                        if node.type != 'OUTPUT_MATERIAL':
+                            nodes.remove(node)
+                            
+                    material_output = nodes.get("Material Output")
+                    if not material_output:
+                        material_output = nodes.new(type="ShaderNodeOutputMaterial")
+                        
+                    shader_node = nodes.new(type="ShaderNodeBsdfPrincipled")
+                    links.new(material_output.inputs["Surface"], shader_node.outputs["BSDF"])
+                    
+                    # Add Checker Texture
+                    checker = nodes.new(type="ShaderNodeTexChecker")
+                    checker.inputs["Color1"].default_value = (0.4, 0.4, 0.4, 1.0) # Dark grey
+                    checker.inputs["Color2"].default_value = (0.5, 0.5, 0.5, 1.0) # Light grey
+                    checker.inputs["Scale"].default_value = 10.0 # Scale of checker grid
+                    
+                    # Connect Checker Color to Principled Base Color
+                    links.new(shader_node.inputs["Base Color"], checker.outputs["Color"])
+                    
+                    # Set standard roughness
+                    shader_node.inputs["Roughness"].default_value = 0.5
+                    print("Generated default procedural grid for BasicShapeMaterial")
+                    continue
+                else:
+                    print(f"Material file not found for: {mat_name}")
+                    continue
+                
+            textures, scalars, vectors, mat_data = load_material_data(mat_file)
                     
             if not textures and not scalars and not vectors:
                 continue
@@ -1873,20 +1989,103 @@ class MaterialImporter(bpy.types.Operator):
                 continue
                 
             # Extract Set A texture parameter mappings
-            diffuse_tex = textures.get("diffuse") or textures.get("basecolor") or textures.get("basecolorcomponent") or textures.get("basecolortex") or textures.get("color") or textures.get("albedo") or textures.get("other[0]") or textures.get("pm_diffuse")
-            normal_tex = textures.get("normal") or textures.get("normaltex") or textures.get("normalcomponent") or textures.get("pm_normals")
+            diffuse_tex = (
+                textures.get("diffuse") or 
+                textures.get("basecolor") or 
+                textures.get("basecolortexture") or 
+                textures.get("base_color_texture") or 
+                textures.get("basecolorcomponent") or 
+                textures.get("basecolortex") or 
+                textures.get("color") or 
+                textures.get("albedo") or 
+                textures.get("diffuse1") or 
+                textures.get("diffusetexture") or 
+                textures.get("other[0]") or 
+                textures.get("pm_diffuse")
+            )
+            normal_tex = (
+                textures.get("normal") or 
+                textures.get("normaltex") or 
+                textures.get("normaltexture") or 
+                textures.get("normalmap") or 
+                textures.get("normalcomponent") or 
+                textures.get("pm_normals")
+            )
             spec_tex = textures.get("specular") or textures.get("spec") or textures.get("specpower")
             rough_tex = textures.get("roughness") or textures.get("rough") or textures.get("roughnesstex")
             metallic_tex = textures.get("metallic") or textures.get("metal") or textures.get("metallictex")
-            mask_tex = textures.get("masks") or textures.get("mask") or textures.get("maskstex") or textures.get("mra") or textures.get("ormh") or textures.get("orm") or textures.get("pm_specularmasks") or textures.get("specularmasks")
+            mask_tex = (
+                textures.get("masks") or 
+                textures.get("mask") or 
+                textures.get("maskmap") or 
+                textures.get("maskstex") or 
+                textures.get("mra") or 
+                textures.get("ormh") or 
+                textures.get("orm") or 
+                textures.get("orme") or 
+                textures.get("orme(aoroughmatemis)") or 
+                textures.get("srm") or 
+                textures.get("pm_specularmasks") or 
+                textures.get("specularmasks")
+            )
             emissive_tex = textures.get("emissive") or textures.get("emissivecolor") or textures.get("emissivetex") or textures.get("emissive_color") or textures.get("emissive_tex") or textures.get("pm_emissive")
             
             # Extract Set B texture parameter mappings (for Vertex-Color blended materials)
-            diffuse_tex_b = textures.get("diffuse_b") or textures.get("basecolor_b") or textures.get("basecolor_2") or textures.get("basecolorcomponent_b") or textures.get("basecolortex_b") or textures.get("color_b") or textures.get("albedo_b") or textures.get("other[1]")
-            normal_tex_b = textures.get("normal_b") or textures.get("normal_2") or textures.get("normaltex_b") or textures.get("normalcomponent_b")
+            diffuse_tex_b = (
+                textures.get("diffuse_b") or 
+                textures.get("diffuse2") or 
+                textures.get("basecolor_b") or 
+                textures.get("basecolor_2") or 
+                textures.get("basecolortexture_b") or 
+                textures.get("basecolor_texture_b") or 
+                textures.get("basecolorcomponent_b") or 
+                textures.get("basecolortex_b") or 
+                textures.get("color_b") or 
+                textures.get("albedo_b") or 
+                textures.get("wornbasecolortexture") or 
+                textures.get("worndiffusetexture") or 
+                textures.get("wornalbedo") or 
+                textures.get("albedodamaget") or 
+                textures.get("diffusedamaget") or 
+                textures.get("basecolordamage") or 
+                textures.get("other[1]")
+            )
+            normal_tex_b = (
+                textures.get("normal_b") or 
+                textures.get("normal_2") or 
+                textures.get("normaltex_b") or 
+                textures.get("normaltexture_b") or 
+                textures.get("normalmap_b") or 
+                textures.get("normalcomponent_b") or 
+                textures.get("wornnormal") or 
+                textures.get("wornnormaltexture") or 
+                textures.get("wornnormalmap") or 
+                textures.get("damagenormalt") or 
+                textures.get("damagenormal")
+            )
             rough_tex_b = textures.get("roughness_b") or textures.get("rough_b") or textures.get("roughness_2") or textures.get("roughnesstex_b")
             metallic_tex_b = textures.get("metallic_b") or textures.get("metal_b") or textures.get("metallic_2") or textures.get("metallictex_b")
-            mask_tex_b = textures.get("masks_b") or textures.get("mask_b") or textures.get("maskstex_b") or textures.get("mra_b") or textures.get("ormh_b") or textures.get("orm_b") or textures.get("pm_specularmasks_b") or textures.get("specularmasks_b")
+            mask_tex_b = (
+                textures.get("masks_b") or 
+                textures.get("mask_b") or 
+                textures.get("maskmap_b") or 
+                textures.get("maskstex_b") or 
+                textures.get("mra_b") or 
+                textures.get("ormh_b") or 
+                textures.get("orm_b") or 
+                textures.get("orme_b") or 
+                textures.get("orme(aoroughmatemis)_b") or 
+                textures.get("srm_b") or 
+                textures.get("pm_specularmasks_b") or 
+                textures.get("specularmasks_b") or 
+                textures.get("wornmask") or 
+                textures.get("wornmaskmap") or 
+                textures.get("wornmasks") or 
+                textures.get("wornorm") or 
+                textures.get("wornormh") or 
+                textures.get("wornorme") or 
+                textures.get("wornsrm")
+            )
             
             # Resolve image file paths
             img_exts = {'.tga', '.png', '.jpg', '.jpeg', '.dds'}
@@ -1973,6 +2172,9 @@ class MaterialImporter(bpy.types.Operator):
                     m_node.blend_type = 'MIX'
                     return m_node, "Fac", "Color1", "Color2", "Color"
                     
+            # Detect if diffuse texture was requested but missing on disk
+            diffuse_missing = bool(diffuse_tex and not diffuse_path)
+
             # 1. Base Color & Alpha Setup
             diffuse_node_a = load_texture_node(diffuse_path, "sRGB")
             diffuse_node_b = load_texture_node(diffuse_path_b, "sRGB")
@@ -2021,13 +2223,18 @@ class MaterialImporter(bpy.types.Operator):
                             except Exception:
                                 pass
             else:
-                # No diffuse texture: set solid color if present in vectors
-                base_color = (0.8, 0.8, 0.8, 1.0)
-                for k, val in vectors.items():
-                    k_norm = k.replace(" ", "").replace("_", "").replace("-", "")
-                    if k_norm in ("colour", "color", "basecolor", "diffuse", "diffusecolor", "tint"):
-                        base_color = (val[0], val[1], val[2], 1.0)
-                        break
+                # No diffuse texture loaded
+                if diffuse_missing:
+                    # Set to bright neon magenta/purple to clearly alert the user that the texture file is missing on disk
+                    base_color = (1.0, 0.0, 1.0, 1.0)
+                else:
+                    # No diffuse texture referenced: set solid color if present in vectors
+                    base_color = (0.8, 0.8, 0.8, 1.0)
+                    for k, val in vectors.items():
+                        k_norm = k.replace(" ", "").replace("_", "").replace("-", "")
+                        if k_norm in ("colour", "color", "basecolor", "diffuse", "diffusecolor", "tint"):
+                            base_color = (val[0], val[1], val[2], 1.0)
+                            break
                 shader_node.inputs["Base Color"].default_value = base_color
                 
             # 2. Normal Mapping Setup (with Green-channel inversion)
