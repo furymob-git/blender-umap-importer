@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UMAP Importer",
     "author": "FURYMOB & Gemini",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "category": "Object",
     "description": "Addon that imports Unreal Engine .umap files from exported JSON data into Blender with hierarchy, instances, decals, and vertex-blended materials",
@@ -16,7 +16,7 @@ import time
 
 def update_analysis(self, context):
     try:
-        run_asset_analysis(self)
+        run_asset_analysis(context.scene.my_tool)
     except Exception as e:
         print(f"Error in update_analysis: {e}")
 
@@ -26,9 +26,27 @@ class LIS_ReferencedFolderItem(bpy.types.PropertyGroup):
     missing: bpy.props.IntProperty()
     missing_meshes: bpy.props.IntProperty()
     missing_materials: bpy.props.IntProperty()
+    missing_levels: bpy.props.IntProperty()
     missing_mesh_names: bpy.props.StringProperty()      # newline-separated, max 15
     missing_material_names: bpy.props.StringProperty()  # newline-separated, max 15
+    missing_level_names: bpy.props.StringProperty()     # newline-separated, max 15
     total: bpy.props.IntProperty()
+
+class LIS_SubLevelItem(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty()
+    package_path: bpy.props.StringProperty()
+    enabled: bpy.props.BoolProperty(default=True, update=update_analysis)
+    found: bpy.props.BoolProperty(default=True)
+
+class LIS_UL_sublevels(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            if item.found:
+                row.label(text=item.name, icon="SCENE_DATA")
+            else:
+                row.label(text=f"{item.name} (Missing)", icon="ERROR")
 
 class LIS_UL_referenced_folders(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
@@ -39,6 +57,10 @@ class LIS_UL_referenced_folders(bpy.types.UIList):
                 split.label(text=item.path, icon="FOLDER_REDIRECT")
                 badge_row = split.row(align=True)
                 badge_row.alignment = 'RIGHT'
+                if item.missing_levels > 0:
+                    op = badge_row.operator("lis.show_missing_info", text=str(item.missing_levels), icon="SCENE_DATA", emboss=False)
+                    op.names = item.missing_level_names
+                    op.label = f"{item.missing_levels} missing sublevel(s)"
                 if item.missing_meshes > 0:
                     op = badge_row.operator("lis.show_missing_info", text=str(item.missing_meshes), icon="MESH_DATA", emboss=False)
                     op.names = item.missing_mesh_names
@@ -85,6 +107,23 @@ class MISettings(bpy.types.PropertyGroup):
         default="",
         subtype="DIR_PATH",
         update=update_analysis,
+    )
+    game_paks_path: bpy.props.StringProperty(
+        name="Game Paks Directory",
+        description="Path to the game Paks folder (containing .pak / .utoc / .ucas files)",
+        default="",
+        subtype="DIR_PATH",
+    )
+    game_aes_key: bpy.props.StringProperty(
+        name="Game AES Key",
+        description="AES key for decrypting game containers (hex string). Leave empty if the game doesn't use encryption",
+        default="",
+    )
+    game_usmap_path: bpy.props.StringProperty(
+        name="Game Mappings (.usmap)",
+        description="Optional path to the .usmap mapping file. Required for games with unversioned properties (UE5+). Leave empty if not needed",
+        default="",
+        subtype="FILE_PATH",
     )
     hide_collisions: bpy.props.BoolProperty(
         name="Hide Collision Meshes",
@@ -143,6 +182,14 @@ class MISettings(bpy.types.PropertyGroup):
     )
     analysis_folders: bpy.props.CollectionProperty(type=LIS_ReferencedFolderItem)
     analysis_folders_index: bpy.props.IntProperty(default=0)
+    sublevels: bpy.props.CollectionProperty(type=LIS_SubLevelItem)
+    sublevels_index: bpy.props.IntProperty(default=0)
+    show_sublevels: bpy.props.BoolProperty(
+        name="Show Sub-levels",
+        description="Show or hide the list of streaming sub-levels",
+        default=True,
+    )
+    last_scanned_json: bpy.props.StringProperty(default="")
     import_progress: bpy.props.FloatProperty(
         name="Import Progress",
         description="Current import progress percentage",
@@ -166,58 +213,103 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
     def draw(self, context):
         scene = context.scene
         mytool = scene.my_tool
+        layout = self.layout
         
-        self.layout.prop(mytool, "json_file")
-        self.layout.prop(mytool, "base_directory")
-        self.layout.prop(mytool, "disable_viewport_refresh")
-        self.layout.prop(mytool, "use_smart_resolve")
-        self.layout.prop(mytool, "hide_collisions")
-        self.layout.prop(mytool, "skip_missing_assets")
-        self.layout.prop(mytool, "skip_missing_materials")
-        self.layout.prop(mytool, "import_decals")
+        # 1. File Selection Section
+        box_files = layout.box()
+        box_files.label(text="Input Paths", icon="FOLDER_REDIRECT")
+        box_files.prop(mytool, "json_file", text="UMAP JSON")
+        box_files.prop(mytool, "base_directory", text="Asset Dir")
         
-        row = self.layout.row()
-        row.operator(MapImporter.bl_idname, text="Import Level")
+        # 2. Options Grid Section
+        box_opts = layout.box()
+        box_opts.label(text="Settings", icon="PREFERENCES")
+        row = box_opts.row(align=True)
         
+        col_left = row.column(align=True)
+        col_left.prop(mytool, "disable_viewport_refresh")
+        col_left.prop(mytool, "hide_collisions")
+        col_left.prop(mytool, "import_decals")
+        
+        col_right = row.column(align=True)
+        col_right.prop(mytool, "use_smart_resolve")
+        col_right.prop(mytool, "skip_missing_assets")
+        col_right.prop(mytool, "skip_missing_materials")
+        
+        # 3. Game Asset Extractor Section (temporarily disabled)
+        # TODO: re-enable once extraction is validated
+        # box_extract = layout.box()
+        # box_extract.label(text="Automatic Game Extraction", icon="SCENE_DATA")
+        # box_extract.prop(mytool, "game_paks_path", text="Paks Dir")
+        # box_extract.prop(mytool, "game_aes_key", text="AES Key (optional)")
+        # box_extract.prop(mytool, "game_usmap_path", text="Mappings .usmap (optional)")
+        # box_extract.row().operator("lis.auto_extract_assets", text="Extract Missing Assets", icon="IMPORT")
+        
+        # 4. Import Action Button
+        _importing = 0.0 < mytool.import_progress < 100.0
+        row_import = layout.row()
+        row_import.scale_y = 1.5
+        row_import.enabled = not _importing
+        row_import.operator(MapImporter.bl_idname, text="Import Level", icon="IMPORT")
+        
+        # 5. Progress / Status Section
         if mytool.import_progress > 0.0 and mytool.import_progress < 100.0:
-            box = self.layout.box()
-            box.label(text=mytool.import_status, icon="INFO")
-            row_prog = box.row()
+            box_prog = layout.box()
+            box_prog.label(text=mytool.import_status, icon="INFO")
+            row_prog = box_prog.row()
             row_prog.prop(mytool, "import_progress", text="Progress", slider=True)
             row_prog.enabled = False
-            box.label(text="Press ESC in 3D View to cancel", icon="CANCEL")
+            box_prog.label(text="Press ESC in 3D View to cancel", icon="CANCEL")
         elif mytool.import_progress == 100.0:
-            box = self.layout.box()
-            box.label(text="Import completed successfully!", icon="CHECKMARK")
+            box_prog = layout.box()
+            box_prog.label(text="Import completed successfully!", icon="CHECKMARK")
         
-        self.layout.separator()
-        
-        # Collapsible Analysis Section
-        box = self.layout.box()
-        box.prop(mytool, "show_analysis", text="Asset Analysis / Missing Folders", icon="FILE_TEXT", toggle=True)
-        if mytool.show_analysis:
-            box.label(text=_analysis_results["status"], icon="INFO")
-            
-            row = box.row(align=True)
-            row.prop(mytool, "analysis_depth", text="Folder Depth")
-            row.operator("lis.refresh_analysis", text="", icon="FILE_REFRESH")
+        # 6 & 7. Bottom toggle buttons — side by side to save vertical space
+        row_toggles = layout.row(align=True)
+        if len(mytool.sublevels) > 0:
+            row_toggles.prop(mytool, "show_sublevels",
+                             text=f"Sub-levels ({len(mytool.sublevels)})",
+                             icon="SCENE_DATA", toggle=True)
+        _total = _analysis_results.get("total_count", 0)
+        _analysis_label = f"Asset Analysis ({_total})" if _total > 0 else "Asset Analysis"
+        row_toggles.prop(mytool, "show_analysis",
+                         text=_analysis_label,
+                         icon="FILE_TEXT", toggle=True)
 
+        
+        # Sub-levels expanded content
+        if mytool.show_sublevels and len(mytool.sublevels) > 0:
+            box_sub = layout.box()
+            box_sub.template_list(
+                "LIS_UL_sublevels", "",
+                mytool, "sublevels",
+                mytool, "sublevels_index",
+                rows=4
+            )
+        
+        # Analysis expanded content
+        if mytool.show_analysis:
+            box_analysis = layout.box()
+            box_analysis.label(text=_analysis_results["status"], icon="INFO")
+            
+            row_ctrl = box_analysis.row(align=True)
+            row_ctrl.prop(mytool, "analysis_depth", text="Depth", slider=True)
+            row_ctrl.operator("lis.refresh_analysis", text="", icon="FILE_REFRESH")
             
             if _analysis_results["folders"]:
-                box.prop(mytool, "analysis_mode", expand=True)
+                box_analysis.prop(mytool, "analysis_mode", expand=True)
                 
                 if len(mytool.analysis_folders) == 0:
-                    box.label(text="No folders found.", icon="CHECKMARK")
+                    box_analysis.label(text="No folders found.", icon="CHECKMARK")
                 else:
-                    box.template_list(
+                    box_analysis.template_list(
                         "LIS_UL_referenced_folders", "",
                         mytool, "analysis_folders",
                         mytool, "analysis_folders_index",
-                        rows=8
+                        rows=5
                     )
-                
-                box.separator()
-                box.operator("lis.export_missing_assets", text="Export Detailed List to Text File", icon="EXPORT")
+                    
+            box_analysis.operator("lis.export_missing_assets", text="Export Detailed List to Text File", icon="EXPORT")
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS FOR FILE SEARCHING, TRANSFORMS & GEOMETRY
@@ -542,6 +634,60 @@ def _resolve_file_path_internal(index, ue_path, preferred_exts=None):
 
 _blueprint_mesh_cache = {}
 _blueprint_properties_cache = {}
+_blueprint_object_cache = {}
+_parsed_bp_cache = {}
+
+def resolve_blueprint_object(index, template_path):
+    if not template_path:
+        return {}
+    global _blueprint_object_cache, _parsed_bp_cache
+    if template_path in _blueprint_object_cache:
+        return _blueprint_object_cache[template_path]
+    parts = template_path.split('.')
+    bp_path = parts[0]
+    try:
+        suffix_idx = int(parts[-1])
+    except ValueError:
+        suffix_idx = None
+    bp_json_path = resolve_file_path(index, bp_path, preferred_exts={'.json'})
+    if not bp_json_path or not os.path.exists(bp_json_path):
+        _blueprint_object_cache[template_path] = {}
+        return {}
+    try:
+        if bp_json_path in _parsed_bp_cache:
+            bp_data, bp_by_name = _parsed_bp_cache[bp_json_path]
+        else:
+            with open(bp_json_path, 'r', encoding='utf-8') as f:
+                bp_data = json.load(f)
+            if not isinstance(bp_data, list):
+                bp_data = [bp_data]
+            bp_by_name = {}
+            for item in bp_data:
+                if isinstance(item, dict):
+                    name = item.get("Name")
+                    if name:
+                        bp_by_name[name] = item
+            _parsed_bp_cache[bp_json_path] = (bp_data, bp_by_name)
+
+        obj = None
+        if suffix_idx is not None and suffix_idx < len(bp_data):
+            obj = bp_data[suffix_idx]
+        else:
+            obj_name = template_path.split(':')[-1] if ':' in template_path else parts[-1]
+            obj = bp_by_name.get(obj_name)
+            if not obj:
+                # Substring fallback scan
+                for item in bp_data:
+                    if isinstance(item, dict) and obj_name in item.get("Name", ""):
+                        obj = item
+                        break
+        if obj and isinstance(obj, dict):
+            _blueprint_object_cache[template_path] = obj
+            return obj
+    except Exception as e:
+        print(f"Error parsing blueprint template object for {bp_json_path}: {e}")
+    _blueprint_object_cache[template_path] = {}
+    return {}
 
 def resolve_blueprint_properties(index, template_path):
     """
@@ -550,54 +696,14 @@ def resolve_blueprint_properties(index, template_path):
     """
     if not template_path:
         return {}
-        
     global _blueprint_properties_cache
     if template_path in _blueprint_properties_cache:
         return _blueprint_properties_cache[template_path]
-        
-    parts = template_path.split('.')
-    bp_path = parts[0]
-    try:
-        suffix_idx = int(parts[-1])
-    except ValueError:
-        suffix_idx = None
-        
-    bp_json_path = resolve_file_path(index, bp_path, preferred_exts={'.json'})
-    if not bp_json_path or not os.path.exists(bp_json_path):
-        _blueprint_properties_cache[template_path] = {}
-        return {}
-        
-    try:
-        with open(bp_json_path, 'r', encoding='utf-8') as f:
-            bp_data = json.load(f)
-            
-        if not isinstance(bp_data, list):
-            bp_data = [bp_data]
-            
-        obj = None
-        if suffix_idx is not None and suffix_idx < len(bp_data):
-            obj = bp_data[suffix_idx]
-        else:
-            # Fallback: search by name
-            obj_name = template_path.split(':')[-1] if ':' in template_path else parts[-1]
-            for item in bp_data:
-                if isinstance(item, dict) and item.get("Name") == obj_name:
-                    obj = item
-                    break
-            if not obj:
-                # If still not found, check if ObjectName is inside the Name
-                for item in bp_data:
-                    if isinstance(item, dict) and obj_name in item.get("Name", ""):
-                        obj = item
-                        break
-                        
-        if obj and isinstance(obj, dict):
-            props = obj.get("Properties", {})
-            _blueprint_properties_cache[template_path] = props
-            return props
-    except Exception as e:
-        print(f"Error parsing blueprint template properties for {bp_json_path}: {e}")
-        
+    obj = resolve_blueprint_object(index, template_path)
+    if obj:
+        props = obj.get("Properties", {})
+        _blueprint_properties_cache[template_path] = props
+        return props
     _blueprint_properties_cache[template_path] = {}
     return {}
 
@@ -608,41 +714,46 @@ def resolve_blueprint_mesh(index, template_path):
     """
     if not template_path:
         return None
-        
-    global _blueprint_mesh_cache
+    global _blueprint_mesh_cache, _parsed_bp_cache
     if template_path in _blueprint_mesh_cache:
         return _blueprint_mesh_cache[template_path]
-        
-    props = resolve_blueprint_properties(index, template_path)
-    if props:
-        sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
+    obj = resolve_blueprint_object(index, template_path)
+    if obj:
+        props = obj.get("Properties", {})
+        sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh") or obj.get("StaticMesh") or obj.get("SkeletalMesh")
         if sm_ref and isinstance(sm_ref, dict):
             res = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
             _blueprint_mesh_cache[template_path] = res
             return res
-            
-    # Fallback: search for first object with a StaticMesh or SkeletalMesh property
-    # in the whole blueprint data list
     parts = template_path.split('.')
     bp_path = parts[0]
     bp_json_path = resolve_file_path(index, bp_path, preferred_exts={'.json'})
     if bp_json_path and os.path.exists(bp_json_path):
         try:
-            with open(bp_json_path, 'r', encoding='utf-8') as f:
-                bp_data = json.load(f)
-            if not isinstance(bp_data, list):
-                bp_data = [bp_data]
+            if bp_json_path in _parsed_bp_cache:
+                bp_data, _ = _parsed_bp_cache[bp_json_path]
+            else:
+                with open(bp_json_path, 'r', encoding='utf-8') as f:
+                    bp_data = json.load(f)
+                if not isinstance(bp_data, list):
+                    bp_data = [bp_data]
+                bp_by_name = {}
+                for item in bp_data:
+                    if isinstance(item, dict):
+                        name = item.get("Name")
+                        if name:
+                            bp_by_name[name] = item
+                _parsed_bp_cache[bp_json_path] = (bp_data, bp_by_name)
             for item in bp_data:
                 if isinstance(item, dict):
                     p = item.get("Properties", {})
-                    sm_ref = p.get("StaticMesh") or p.get("SkeletalMesh")
+                    sm_ref = p.get("StaticMesh") or p.get("SkeletalMesh") or item.get("StaticMesh") or item.get("SkeletalMesh")
                     if sm_ref and isinstance(sm_ref, dict):
                         res = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
                         _blueprint_mesh_cache[template_path] = res
                         return res
         except Exception:
             pass
-            
     _blueprint_mesh_cache[template_path] = None
     return None
 
@@ -779,70 +890,173 @@ def clean_unreal_path(raw_path):
         path = path.replace('"', '')
     return path.split('.')[0]
 
-def get_all_referenced_assets(json_filepath, base_dir=None, file_index=None):
+def get_package_path(json_file_path, base_directory):
+    try:
+        rel = os.path.relpath(json_file_path, base_directory).replace('\\', '/')
+        rel_no_ext = os.path.splitext(rel)[0]
+        if not rel_no_ext.startswith('/'):
+            package = '/Game/' + rel_no_ext
+        else:
+            package = rel_no_ext
+        return package.lower()
+    except Exception:
+        name = os.path.splitext(os.path.basename(json_file_path))[0]
+        return f"/game/map/{name.lower()}/{name.lower()}"
+
+def parse_reference_key(ref, current_package):
+    if not ref:
+        return None
+    path = ref.get("ObjectPath") or ref.get("ObjectName") or ""
+    if not path:
+        return None
+    if "'" in path:
+        path = path.split("'")[1]
+    parts = path.split('.')
+    if len(parts) < 2:
+        return None
+    try:
+        idx = int(parts[-1])
+        package = parts[0].lower()
+        return (package, idx)
+    except ValueError:
+        return None
+
+def get_all_referenced_assets(json_filepath, base_dir=None, file_index=None, disabled_sublevels=None):
     """
     Scans a level JSON and all resolved Blueprint templates to extract all
     referenced meshes and materials.
     """
     referenced = set()
-    if not json_filepath or not os.path.exists(json_filepath):
-        return referenced
+    loaded_files = set()
+    
+    def scan_file(filepath):
+        if not filepath or not os.path.exists(filepath):
+            return
+        abs_path = os.path.abspath(filepath).lower()
+        if abs_path in loaded_files:
+            return
+        loaded_files.add(abs_path)
         
-    try:
-        with open(json_filepath, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-            
-        if not isinstance(json_data, list):
-            json_data = [json_data]
-            
-        for entity in json_data:
-            props = entity.get("Properties", {})
-            etype = entity.get("Type", "")
-            
-            # 1. Mesh components
-            if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent", "SkeletalMeshComponent"):
-                sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
-                if sm_ref:
-                    mesh_path = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+            if not isinstance(json_data, list):
+                json_data = [json_data]
+                
+            for entity in json_data:
+                props = entity.get("Properties", {})
+                etype = entity.get("Type", "")
+                
+                # 1. Mesh components
+                if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent", "SkeletalMeshComponent"):
+                    sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
+                    mesh_path = None
+                    if sm_ref:
+                        mesh_path = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
+                    else:
+                        template_ref = entity.get("Template")
+                        if template_ref:
+                            template_path = template_ref.get("ObjectPath")
+                            if template_path and file_index:
+                                mesh_path = resolve_blueprint_mesh(file_index, template_path)
                     if mesh_path:
                         referenced.add(("mesh", mesh_path))
-                else:
-                    # Blueprint template
-                    template_ref = entity.get("Template")
-                    if template_ref:
-                        template_path = template_ref.get("ObjectPath")
-                        if template_path and file_index:
-                            mesh_path = resolve_blueprint_mesh(file_index, template_path)
-                            if mesh_path:
-                                referenced.add(("mesh", mesh_path))
+                        
+                    # Override materials
+                    override_mats = props.get("OverrideMaterials", [])
+                    for mat in override_mats:
+                        if mat:
+                            mat_path = mat.get("ObjectPath") or mat.get("ObjectName")
+                            if mat_path:
+                                referenced.add(("material", mat_path))
                                 
-                # Override materials
-                override_mats = props.get("OverrideMaterials", [])
-                for mat in override_mats:
-                    if mat:
-                        mat_path = mat.get("ObjectPath") or mat.get("ObjectName")
+                # 2. Decals
+                elif etype == "DecalComponent":
+                    mat_ref = props.get("DecalMaterial")
+                    if mat_ref:
+                        mat_path = mat_ref.get("ObjectPath") or mat_ref.get("ObjectName")
                         if mat_path:
                             referenced.add(("material", mat_path))
                             
-            # 2. Decals
-            elif etype == "DecalComponent":
-                mat_ref = props.get("DecalMaterial")
-                if mat_ref:
-                    mat_path = mat_ref.get("ObjectPath") or mat_ref.get("ObjectName")
-                    if mat_path:
-                        referenced.add(("material", mat_path))
-                        
-    except Exception as e:
-        print(f"Error gathering referenced assets: {e}")
-        
+                # 3. Level Streaming (AlwaysLoaded or dynamic)
+                elif "streaming" in etype.lower():
+                    world_asset = props.get("WorldAsset")
+                    if world_asset:
+                        asset_path = world_asset.get("AssetPathName")
+                        if asset_path and file_index:
+                            clean_p = clean_unreal_path(asset_path)
+                            if disabled_sublevels and clean_p.lower() in disabled_sublevels:
+                                continue
+                            sub_path = resolve_file_path(file_index, clean_p, preferred_exts={'.json'})
+                            if sub_path:
+                                scan_file(sub_path)
+                            else:
+                                referenced.add(("level", asset_path))
+                                
+        except Exception as e:
+            print(f"Error gathering referenced assets from {filepath}: {e}")
+
+    scan_file(json_filepath)
     return referenced
+
+def populate_sublevels(mytool):
+    if not mytool.json_file or not os.path.exists(mytool.json_file):
+        mytool.sublevels.clear()
+        mytool.last_scanned_json = ""
+        return
+        
+    if mytool.json_file == mytool.last_scanned_json and len(mytool.sublevels) > 0:
+        return
+        
+    mytool.sublevels.clear()
+    mytool.last_scanned_json = mytool.json_file
+    
+    try:
+        with open(mytool.json_file, 'r', encoding='utf-8') as f:
+            json_data = json.load(f)
+        if not isinstance(json_data, list):
+            json_data = [json_data]
+            
+        base_dir = mytool.base_directory
+        file_index = get_cached_index(base_dir) if (base_dir and os.path.exists(base_dir)) else None
+
+        found = set()
+        for entity in json_data:
+            etype = entity.get("Type", "")
+            if "streaming" in etype.lower():
+                props = entity.get("Properties", {})
+                world_asset = props.get("WorldAsset")
+                if world_asset:
+                    asset_path = world_asset.get("AssetPathName")
+                    if asset_path:
+                        clean_p = clean_unreal_path(asset_path)
+                        name = os.path.basename(clean_p)
+                        if clean_p not in found:
+                            found.add(clean_p)
+                            item = mytool.sublevels.add()
+                            item.name = name
+                            item.package_path = clean_p.lower()
+                            item.enabled = True
+                            
+                            is_found = False
+                            if file_index:
+                                is_found = bool(resolve_file_path(file_index, clean_p.lower(), preferred_exts={'.json'}))
+                            item.found = is_found
+    except Exception as e:
+        print(f"Error scanning sublevels for UI: {e}")
 
 def run_asset_analysis(mytool):
     """
     Processes all level JSON assets, verifies existence, and groups missing/total counts by folder.
     """
-    global _analysis_results, _resolve_cache
+    populate_sublevels(mytool)
+    
+    global _analysis_results, _resolve_cache, _blueprint_object_cache, _blueprint_mesh_cache, _blueprint_properties_cache, _parsed_bp_cache
     _resolve_cache.clear()
+    _blueprint_object_cache.clear()
+    _blueprint_mesh_cache.clear()
+    _blueprint_properties_cache.clear()
+    _parsed_bp_cache.clear()
     json_path = mytool.json_file
     base_dir = mytool.base_directory
     
@@ -859,7 +1073,14 @@ def run_asset_analysis(mytool):
     if base_dir and os.path.exists(base_dir):
         file_index = get_cached_index(base_dir)
         
-    referenced_assets = get_all_referenced_assets(json_path, base_dir, file_index)
+    for item in mytool.sublevels:
+        is_found = False
+        if file_index:
+            is_found = bool(resolve_file_path(file_index, item.package_path, preferred_exts={'.json'}))
+        item.found = is_found
+        
+    disabled_sublevels = {item.package_path for item in mytool.sublevels if not item.enabled}
+    referenced_assets = get_all_referenced_assets(json_path, base_dir, file_index, disabled_sublevels)
     if not referenced_assets:
         _analysis_results = {
             "status": "No assets referenced or JSON empty/invalid",
@@ -895,8 +1116,8 @@ def run_asset_analysis(mytool):
                 folder = '/' + '/'.join(parts[:depth])
             
         if folder not in folders_data:
-            folders_data[folder] = {"missing": 0, "missing_meshes": 0, "missing_materials": 0,
-                                    "missing_mesh_names": [], "missing_material_names": [], "total": 0}
+            folders_data[folder] = {"missing": 0, "missing_meshes": 0, "missing_materials": 0, "missing_levels": 0,
+                                    "missing_mesh_names": [], "missing_material_names": [], "missing_level_names": [], "total": 0}
             
         folders_data[folder]["total"] += 1
         
@@ -906,7 +1127,12 @@ def run_asset_analysis(mytool):
         elif asset_type == "material" and is_basic_shape_material(ue_path):
             found = True
         elif file_index:
-            preferred = {'.gltf', '.glb', '.fbx', '.obj'} if asset_type == "mesh" else {'.json', '.mat'}
+            if asset_type == "mesh":
+                preferred = {'.gltf', '.glb', '.fbx', '.obj'}
+            elif asset_type == "level":
+                preferred = {'.json'}
+            else:
+                preferred = {'.json', '.mat'}
             found_path = resolve_file_path(file_index, clean_path, preferred_exts=preferred)
             if found_path:
                 found = True
@@ -917,6 +1143,9 @@ def run_asset_analysis(mytool):
             if asset_type == "mesh":
                 folders_data[folder]["missing_meshes"] += 1
                 folders_data[folder]["missing_mesh_names"].append(asset_name)
+            elif asset_type == "level":
+                folders_data[folder]["missing_levels"] += 1
+                folders_data[folder]["missing_level_names"].append(asset_name)
             else:
                 folders_data[folder]["missing_materials"] += 1
                 folders_data[folder]["missing_material_names"].append(asset_name)
@@ -927,17 +1156,22 @@ def run_asset_analysis(mytool):
         # Cap names at 15 entries for tooltip readability
         mesh_names = data["missing_mesh_names"][:15]
         mat_names = data["missing_material_names"][:15]
+        level_names = data["missing_level_names"][:15]
         if len(data["missing_mesh_names"]) > 15:
             mesh_names.append(f"... and {len(data['missing_mesh_names']) - 15} more")
         if len(data["missing_material_names"]) > 15:
             mat_names.append(f"... and {len(data['missing_material_names']) - 15} more")
+        if len(data["missing_level_names"]) > 15:
+            level_names.append(f"... and {len(data['missing_level_names']) - 15} more")
         folders_list.append({
             "path": f_path,
             "missing": data["missing"],
             "missing_meshes": data["missing_meshes"],
             "missing_materials": data["missing_materials"],
+            "missing_levels": data["missing_levels"],
             "missing_mesh_names": "\n".join(mesh_names),
             "missing_material_names": "\n".join(mat_names),
+            "missing_level_names": "\n".join(level_names),
             "total": data["total"]
         })
         
@@ -971,8 +1205,10 @@ def run_asset_analysis(mytool):
         item.missing = f["missing"]
         item.missing_meshes = f["missing_meshes"]
         item.missing_materials = f["missing_materials"]
+        item.missing_levels = f["missing_levels"]
         item.missing_mesh_names = f["missing_mesh_names"]
         item.missing_material_names = f["missing_material_names"]
+        item.missing_level_names = f["missing_level_names"]
         item.total = f["total"]
 
 
@@ -1023,6 +1259,21 @@ def clone_hierarchy(src_obj, name, collection, unhide=True, hide_collisions=Fals
     Creates a deep copy of a Blender object hierarchy, sharing the original
     mesh data blocks to preserve memory and keep things instanced.
     """
+    if not src_obj.children:
+        new_obj = bpy.data.objects.new(name=name, object_data=src_obj.data)
+        collection.objects.link(new_obj)
+        new_obj.matrix_basis = src_obj.matrix_basis.copy()
+        if hide_collisions and is_collision_mesh(src_obj.name):
+            new_obj.hide_viewport = True
+            new_obj.hide_render = True
+        elif unhide:
+            new_obj.hide_viewport = False
+            new_obj.hide_render = False
+        else:
+            new_obj.hide_viewport = src_obj.hide_viewport
+            new_obj.hide_render = src_obj.hide_render
+        return new_obj
+
     lookup = {}
     
     def clone_node(obj):
@@ -1064,9 +1315,9 @@ def import_asset(filepath, name, collection, hide_collisions=False):
     try:
         if ext in ('.gltf', '.glb'):
             if hasattr(bpy.ops.wm, "gltf_import") and "gltf_import" in dir(bpy.ops.wm):
-                bpy.ops.wm.gltf_import(filepath=filepath)
+                bpy.ops.wm.gltf_import(filepath=filepath, loglevel=50)
             else:
-                bpy.ops.import_scene.gltf(filepath=filepath)
+                bpy.ops.import_scene.gltf(filepath=filepath, loglevel=50)
         elif ext == '.fbx':
             bpy.ops.import_scene.fbx(filepath=filepath)
         elif ext == '.obj':
@@ -1187,6 +1438,10 @@ class MapImporter(bpy.types.Operator):
         if self.gc_was_enabled:
             gc.disable()
 
+        # Save global undo state and disable it to speed up imports
+        self.undo_state = context.preferences.edit.use_global_undo
+        context.preferences.edit.use_global_undo = False
+
         if bpy.app.background:
             # Headless fallback: run synchronously
             print("Running in background/headless mode. Running synchronously...")
@@ -1199,6 +1454,7 @@ class MapImporter(bpy.types.Operator):
             if self.gc_was_enabled:
                 gc.enable()
                 gc.collect()
+            context.preferences.edit.use_global_undo = self.undo_state
             return {'FINISHED'}
             
         # Interactive mode: run modally with a timer
@@ -1267,6 +1523,10 @@ class MapImporter(bpy.types.Operator):
             self._timer = None
         self.generator = None
         
+        # Restore global undo preference
+        if hasattr(self, 'undo_state'):
+            context.preferences.edit.use_global_undo = self.undo_state
+            
         # Restore viewport visibility of the collection if it was hidden
         if hasattr(self, 'collection_name') and self.collection_name:
             import_collection = bpy.data.collections.get(self.collection_name)
@@ -1280,16 +1540,25 @@ class MapImporter(bpy.types.Operator):
                 gc.enable()
                 gc.collect()
                 
+        # Clear temporary caches to free memory
+        global _blueprint_mesh_cache, _blueprint_properties_cache, _resolve_cache, _blueprint_object_cache, _parsed_bp_cache
+        _blueprint_mesh_cache.clear()
+        _blueprint_properties_cache.clear()
+        _resolve_cache.clear()
+        _blueprint_object_cache.clear()
+        _parsed_bp_cache.clear()
+        
         # Reset progress values
         context.scene.my_tool.import_progress = 0.0
         context.scene.my_tool.import_status = "Idle"
 
     def import_generator(self, context):
-        # Clear caches for a fresh import
-        global _blueprint_mesh_cache, _blueprint_properties_cache, _resolve_cache
+        global _blueprint_mesh_cache, _blueprint_properties_cache, _resolve_cache, _blueprint_object_cache, _parsed_bp_cache
         _blueprint_mesh_cache.clear()
         _blueprint_properties_cache.clear()
         _resolve_cache.clear()
+        _blueprint_object_cache.clear()
+        _parsed_bp_cache.clear()
 
         scene = context.scene
         mytool = scene.my_tool
@@ -1301,7 +1570,6 @@ class MapImporter(bpy.types.Operator):
         skip_missing_materials = mytool.skip_missing_materials
         import_decals = mytool.import_decals
         
-        # 1. Directory indexing
         mytool.import_status = "Scanning asset directory..."
         mytool.import_progress = 5.0
         yield False
@@ -1310,19 +1578,50 @@ class MapImporter(bpy.types.Operator):
         mytool.import_progress = 10.0
         yield False
         
-        # 2. Parse level JSON
-        mytool.import_status = "Parsing level JSON..."
+        mytool.import_status = "Parsing level JSON and sub-levels..."
         yield False
         
-        with open(map_json, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-            
-        if not isinstance(json_data, list):
-            json_data = [json_data]
-            
-        total_objects = len(json_data)
+        disabled_sublevels = {item.package_path for item in mytool.sublevels if not item.enabled}
         
-        # Create map collection
+        queue = [map_json]
+        loaded_json_paths = {os.path.abspath(map_json).lower()}
+        all_entities = []
+        missing_sublevels = []
+        
+        while queue:
+            current_json = queue.pop(0)
+            current_package = get_package_path(current_json, base_dir)
+            try:
+                with open(current_json, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                if not isinstance(json_data, list):
+                    json_data = [json_data]
+                for idx, entity in enumerate(json_data):
+                    all_entities.append((current_package, idx, entity))
+                    
+                    etype = entity.get("Type", "")
+                    if "streaming" in etype.lower():
+                        props = entity.get("Properties", {})
+                        world_asset = props.get("WorldAsset")
+                        if world_asset:
+                            asset_path = world_asset.get("AssetPathName")
+                            if asset_path:
+                                clean_p = clean_unreal_path(asset_path)
+                                if clean_p.lower() in disabled_sublevels:
+                                    continue
+                                sub_json_path = resolve_file_path(file_index, clean_p, preferred_exts={'.json'})
+                                if sub_json_path:
+                                    abs_sub = os.path.abspath(sub_json_path).lower()
+                                    if abs_sub not in loaded_json_paths:
+                                        loaded_json_paths.add(abs_sub)
+                                        queue.append(sub_json_path)
+                                else:
+                                    missing_sublevels.append(asset_path)
+            except Exception as e:
+                print(f"Error loading level JSON {current_json}: {e}")
+                
+        total_objects = len(all_entities)
+        
         json_filename = os.path.basename(map_json)
         collection_name = os.path.splitext(json_filename)[0]
         import_collection = bpy.data.collections.get(collection_name)
@@ -1336,144 +1635,140 @@ class MapImporter(bpy.types.Operator):
         blender_objs = {}
         local_matrices = {}
         mesh_cache = {}
-        parent_relations = {} # child index -> parent index
+        material_cache = {}
+        parent_relations = {}
         decal_objs = []
         
-        # Pass 1: Instantiation of all Actors and Components
         last_yield_time = time.time()
-        time_slice = 0.2 if mytool.disable_viewport_refresh else 0.015
+        time_slice = 0.25  # Yield every 250ms for responsive UI and progress updates
         
-        for i, entity in enumerate(json_data):
-            # Time-slicing: yield to Blender so it updates the UI/viewport
+        for i, (package_path, idx, entity) in enumerate(all_entities):
             if time.time() - last_yield_time > time_slice:
                 mytool.import_status = f"Importing components ({i}/{total_objects})..."
-                mytool.import_progress = 10.0 + (i / total_objects) * 70.0 # scale loop to 10% - 80% range
+                mytool.import_progress = 10.0 + (i / total_objects) * 70.0
                 yield False
                 last_yield_time = time.time()
                 
             etype = entity.get("Type", "")
-            ename = entity.get("Name", f"Obj_{i}")
+            ename = entity.get("Name", f"Obj_{idx}")
+            global_key = (package_path, idx)
             
-            # Determine if it's an Actor (top-level) or a Component
             outer_dict = entity.get("Outer")
             is_actor = False
-            outer_index = None
+            outer_key = None
             if outer_dict:
                 outer_name = outer_dict.get("ObjectName", "")
-                outer_path = outer_dict.get("ObjectPath", "")
-                if outer_name.startswith("Level'"):
+                if outer_name.startswith("Level'") or outer_name.startswith("World'"):
                     is_actor = True
                 else:
-                    parts = outer_path.split('.')
-                    if len(parts) > 1:
-                        try:
-                            outer_index = int(parts[-1])
-                        except ValueError:
-                            pass
+                    outer_key = parse_reference_key(outer_dict, package_path)
             else:
                 is_actor = True
                 
             props = entity.get("Properties", {})
             
-            # Resolve blueprint template properties if Template is present
             template_ref = entity.get("Template")
             if template_ref and file_index:
                 template_path = template_ref.get("ObjectPath")
                 if template_path:
                     template_props = resolve_blueprint_properties(file_index, template_path)
-                    # Merge properties: template properties are overridden by instance properties
                     props = {**template_props, **props}
             
             if is_actor:
-                # Actors get represented as Blender Empties to group their components
                 label = entity.get("ActorLabel", ename)
                 actor_empty = bpy.data.objects.new(name=label, object_data=None)
                 import_collection.objects.link(actor_empty)
-                blender_objs[i] = actor_empty
-                local_matrices[i] = mathutils.Matrix.Identity(4)
+                blender_objs[global_key] = actor_empty
+                local_matrices[global_key] = mathutils.Matrix.Identity(4)
                 continue
                 
-            # Retrieve component transform
             loc = props.get("RelativeLocation", {})
             rot = props.get("RelativeRotation", {})
             scale = props.get("RelativeScale3D", {})
-            local_matrices[i] = get_blender_transform(loc, rot, scale)
+            local_matrices[global_key] = get_blender_transform(loc, rot, scale)
             
-            # Parent configuration mapping
             attach_parent = props.get("AttachParent")
-            if attach_parent:
-                parts = attach_parent.get("ObjectPath", "").split('.')
-                if len(parts) > 1:
-                    try:
-                        parent_relations[i] = int(parts[-1])
-                    except ValueError:
-                        pass
-            elif outer_index is not None:
-                parent_relations[i] = outer_index
+            attach_parent_key = parse_reference_key(attach_parent, package_path) if attach_parent else None
+            
+            if attach_parent_key:
+                parent_relations[global_key] = attach_parent_key
+            elif outer_key:
+                parent_relations[global_key] = outer_key
                 
-            # Skip component if missing overridden materials and toggle is on
             if skip_missing_materials and should_skip_component_due_to_missing_materials(etype, props, file_index):
                 print(f"Skipping component {ename} because its overridden materials are missing from disk.")
                 continue
                 
-            # Parse component categories
             if etype in ("StaticMeshComponent", "InstancedStaticMeshComponent", "HierarchicalInstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent", "SkeletalMeshComponent"):
                 sm_ref = props.get("StaticMesh") or props.get("SkeletalMesh")
                 mesh_path = None
                 if sm_ref:
                     mesh_path = sm_ref.get("ObjectPath") or sm_ref.get("ObjectName")
                 else:
-                    # Try resolving static/skeletal mesh from template blueprint JSON
                     template_ref = entity.get("Template")
                     if template_ref:
                         template_path = template_ref.get("ObjectPath")
                         mesh_path = resolve_blueprint_mesh(file_index, template_path)
                         
                 if not mesh_path:
-                    # Fallback to Empty SceneComponent
                     if not skip_missing_assets:
                         empty_obj = bpy.data.objects.new(name=ename, object_data=None)
                         import_collection.objects.link(empty_obj)
-                        blender_objs[i] = empty_obj
+                        blender_objs[global_key] = empty_obj
                     continue
                     
-                # Support instanced static meshes (ISM / HISM / Foliage)
                 instances = entity.get("PerInstanceSMData")
                 if not instances and "Properties" in entity:
                     instances = entity.get("Properties", {}).get("PerInstanceSMData")
                     
+                if not instances and file_index:
+                    template_ref = entity.get("Template")
+                    if template_ref:
+                        template_path = template_ref.get("ObjectPath")
+                        if template_path:
+                            template_obj = resolve_blueprint_object(file_index, template_path)
+                            if template_obj:
+                                instances = template_obj.get("PerInstanceSMData")
+                                if not instances and "Properties" in template_obj:
+                                    instances = template_obj.get("Properties", {}).get("PerInstanceSMData")
+                                    
                 if instances and etype in ("HierarchicalInstancedStaticMeshComponent", "InstancedStaticMeshComponent", "FoliageInstancedStaticMeshComponent"):
                     print(f"Creating Instanced Component {ename} ({len(instances)} instances)")
                     comp_empty = bpy.data.objects.new(name=ename, object_data=None)
                     import_collection.objects.link(comp_empty)
-                    blender_objs[i] = comp_empty
+                    blender_objs[global_key] = comp_empty
                     
-                    # Cache/import the template mesh
                     base_mesh = None
                     if mesh_path in mesh_cache:
                         base_mesh = mesh_cache[mesh_path]
                     else:
                         if is_basic_shape(mesh_path):
                             base_mesh = create_basic_shape(mesh_path, f"{ename}_Template", import_collection)
+                            mesh_cache[mesh_path] = base_mesh
                             if base_mesh:
-                                mesh_cache[mesh_path] = base_mesh
                                 base_mesh.hide_viewport = True
                                 base_mesh.hide_render = True
                         else:
                             mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
                             if mesh_file:
                                 base_mesh = import_asset(mesh_file, f"{ename}_Template", import_collection, hide_collisions)
-                                if base_mesh:
-                                    mesh_cache[mesh_path] = base_mesh
-                                    base_mesh.hide_viewport = True
-                                    base_mesh.hide_render = True
+                            mesh_cache[mesh_path] = base_mesh
+                            if base_mesh:
+                                base_mesh.hide_viewport = True
+                                base_mesh.hide_render = True
                                 
                     if not base_mesh:
                         print(f"Asset file not found or failed to import for: {mesh_path}")
                         continue
                         
                     if base_mesh:
+                        num_instances = len(instances)
                         for inst_idx, inst in enumerate(instances):
+                            if inst_idx % 100 == 0 and time.time() - last_yield_time > time_slice:
+                                mytool.import_status = f"Importing components ({i}/{total_objects}) - Instancing {ename} ({inst_idx}/{num_instances})..."
+                                mytool.import_progress = 10.0 + ((i + (inst_idx / num_instances)) / total_objects) * 70.0
+                                yield False
+                                last_yield_time = time.time()
                             trans_data = inst.get("TransformData", {})
                             if not trans_data:
                                 continue
@@ -1487,16 +1782,16 @@ class MapImporter(bpy.types.Operator):
                             clone_obj.matrix_basis = inst_matrix
                             
                 else:
-                    # Single mesh import logic
                     mesh_obj = None
                     if mesh_path in mesh_cache:
-                        mesh_obj = clone_hierarchy(mesh_cache[mesh_path], ename, import_collection, unhide=True, hide_collisions=hide_collisions)
+                        cached_mesh = mesh_cache[mesh_path]
+                        if cached_mesh:
+                            mesh_obj = clone_hierarchy(cached_mesh, ename, import_collection, unhide=True, hide_collisions=hide_collisions)
                     else:
                         if is_basic_shape(mesh_path):
                             mesh_obj = create_basic_shape(mesh_path, ename, import_collection)
+                            mesh_cache[mesh_path] = mesh_obj
                             if mesh_obj:
-                                mesh_cache[mesh_path] = mesh_obj
-                                # Apply OverrideMaterials from props onto the generated shape
                                 override_mats = props.get("OverrideMaterials", [])
                                 if override_mats and mesh_obj.type == 'MESH':
                                     mesh_obj.data.materials.clear()
@@ -1505,27 +1800,28 @@ class MapImporter(bpy.types.Operator):
                                             mat_path = mat_ref.get("ObjectPath") or mat_ref.get("ObjectName") or ""
                                             mat_clean = mat_path.split("'")[1] if "'" in mat_path else mat_path
                                             mat_clean = mat_clean.split(".")[0].split("/")[-1]
-                                            mat = bpy.data.materials.get(mat_clean)
+                                            mat = material_cache.get(mat_clean)
                                             if not mat:
-                                                mat = bpy.data.materials.new(name=mat_clean)
-                                                mat.use_nodes = True
+                                                mat = bpy.data.materials.get(mat_clean)
+                                                if not mat:
+                                                    mat = bpy.data.materials.new(name=mat_clean)
+                                                    mat.use_nodes = True
+                                                material_cache[mat_clean] = mat
                                             mesh_obj.data.materials.append(mat)
                         else:
                             mesh_file = resolve_file_path(file_index, mesh_path, preferred_exts={'.gltf', '.glb', '.fbx', '.obj'})
                             if mesh_file:
                                 mesh_obj = import_asset(mesh_file, ename, import_collection, hide_collisions)
-                                if mesh_obj:
-                                    mesh_cache[mesh_path] = mesh_obj
+                            mesh_cache[mesh_path] = mesh_obj
                                 
                     if mesh_obj:
-                        blender_objs[i] = mesh_obj
+                        blender_objs[global_key] = mesh_obj
                     else:
                         if not skip_missing_assets:
                             empty_obj = bpy.data.objects.new(name=ename, object_data=None)
                             import_collection.objects.link(empty_obj)
-                            blender_objs[i] = empty_obj
+                            blender_objs[global_key] = empty_obj
                         
-            # Light Components
             elif etype in ("SpotLightComponent", "PointLightComponent", "DirectionalLightComponent", "RectLightComponent"):
                 light_type = 'POINT'
                 if etype == "SpotLightComponent":
@@ -1536,7 +1832,6 @@ class MapImporter(bpy.types.Operator):
                     light_type = 'AREA'
                     
                 light_data = bpy.data.lights.new(name=ename, type=light_type)
-                
                 intensity = props.get("Intensity", 0.0)
                 if intensity > 0.0:
                     light_data.energy = intensity / 100.0
@@ -1547,9 +1842,8 @@ class MapImporter(bpy.types.Operator):
                     
                 light_obj = bpy.data.objects.new(name=ename, object_data=light_data)
                 import_collection.objects.link(light_obj)
-                blender_objs[i] = light_obj
+                blender_objs[global_key] = light_obj
                 
-            # Decal Projection Support
             elif etype == "DecalComponent":
                 if not import_decals:
                     continue
@@ -1561,42 +1855,41 @@ class MapImporter(bpy.types.Operator):
                 
                 material_obj = None
                 if mat_name:
-                    material_obj = bpy.data.materials.get(mat_name)
+                    material_obj = material_cache.get(mat_name)
                     if not material_obj:
-                        material_obj = bpy.data.materials.new(name=mat_name)
-                        material_obj.use_nodes = True
+                        material_obj = bpy.data.materials.get(mat_name)
+                        if not material_obj:
+                            material_obj = bpy.data.materials.new(name=mat_name)
+                            material_obj.use_nodes = True
+                        material_cache[mat_name] = material_obj
                         
                 decal_obj = create_decal_plane_mesh(ename, material_obj, import_collection)
-                blender_objs[i] = decal_obj
+                blender_objs[global_key] = decal_obj
                 decal_objs.append((decal_obj, props))
                 
-                # Apply DecalSize if present in properties
                 decal_size = props.get("DecalSize", {})
                 if decal_size:
                     ds_x = decal_size.get("X", 128.0) / 128.0
                     ds_y = decal_size.get("Y", 128.0) / 128.0
                     ds_z = decal_size.get("Z", 128.0) / 128.0
                     scale_decal_mat = mathutils.Matrix.Diagonal((ds_x, ds_y, ds_z, 1.0))
-                    local_matrices[i] = local_matrices[i] @ scale_decal_mat
+                    local_matrices[global_key] = local_matrices[global_key] @ scale_decal_mat
                 
-            # Default component wrapper (SceneComponent)
             else:
                 empty_obj = bpy.data.objects.new(name=ename, object_data=None)
                 import_collection.objects.link(empty_obj)
-                blender_objs[i] = empty_obj
+                blender_objs[global_key] = empty_obj
                 
-        # Pass 2: Parenting Links
         mytool.import_status = "Establishing parenting structures..."
         mytool.import_progress = 85.0
         yield False
         
-        for i, obj in blender_objs.items():
-            if i in parent_relations:
-                p_idx = parent_relations[i]
-                if p_idx in blender_objs:
-                    obj.parent = blender_objs[p_idx]
+        for key, obj in blender_objs.items():
+            if key in parent_relations:
+                p_key = parent_relations[key]
+                if p_key in blender_objs:
+                    obj.parent = blender_objs[p_key]
                     
-        # Clean up empty wrappers if skip_missing_assets is enabled
         if skip_missing_assets:
             mytool.import_status = "Cleaning up empty placeholders..."
             mytool.import_progress = 90.0
@@ -1609,26 +1902,25 @@ class MapImporter(bpy.types.Operator):
                     obj = obj.parent
                 return depth
                 
-            empties = [(i, obj) for i, obj in blender_objs.items() if obj.type == 'EMPTY']
+            empties = [(key, obj) for key, obj in blender_objs.items() if obj.type == 'EMPTY']
             empties.sort(key=lambda x: get_depth(x[1]), reverse=True)
             
-            for i, obj in empties:
+            for key, obj in empties:
                 if not obj.children:
                     if obj.name in import_collection.objects:
                         import_collection.objects.unlink(obj)
                     bpy.data.objects.remove(obj, do_unlink=True)
-                    del blender_objs[i]
-                    if i in local_matrices:
-                        del local_matrices[i]
+                    del blender_objs[key]
+                    if key in local_matrices:
+                        del local_matrices[key]
                     
-        # Pass 3: Apply transforms
         mytool.import_status = "Assigning transformations..."
         mytool.import_progress = 95.0
         yield False
         
-        for i, obj in blender_objs.items():
-            if i in local_matrices:
-                obj.matrix_basis = local_matrices[i]
+        for key, obj in blender_objs.items():
+            if key in local_matrices:
+                obj.matrix_basis = local_matrices[key]
                 
         # Decal Projection/Snapping Phase
         if decal_objs:
@@ -2769,6 +3061,8 @@ class ExportMissingAssetsListOperator(bpy.types.Operator):
                 found_meshes = []
                 missing_mats = []
                 found_mats = []
+                missing_levels = []
+                found_levels = []
                 
                 for asset_type, ue_path in sorted(referenced_assets, key=lambda x: x[1]):
                     clean_path = clean_unreal_path(ue_path)
@@ -2778,7 +3072,12 @@ class ExportMissingAssetsListOperator(bpy.types.Operator):
                     elif asset_type == "material" and is_basic_shape_material(ue_path):
                         found = True
                     elif file_index:
-                        preferred = {'.gltf', '.glb', '.fbx', '.obj'} if asset_type == "mesh" else {'.json', '.mat'}
+                        if asset_type == "mesh":
+                            preferred = {'.gltf', '.glb', '.fbx', '.obj'}
+                        elif asset_type == "level":
+                            preferred = {'.json'}
+                        else:
+                            preferred = {'.json', '.mat'}
                         found_path = resolve_file_path(file_index, clean_path, preferred_exts=preferred)
                         if found_path:
                             found = True
@@ -2788,12 +3087,22 @@ class ExportMissingAssetsListOperator(bpy.types.Operator):
                             found_meshes.append(ue_path)
                         else:
                             missing_meshes.append(ue_path)
+                    elif asset_type == "level":
+                        if found:
+                            found_levels.append(ue_path)
+                        else:
+                            missing_levels.append(ue_path)
                     else:
                         if found:
                             found_mats.append(ue_path)
                         else:
                             missing_mats.append(ue_path)
                             
+                f.write(f"--- MISSING SUB-LEVELS ({len(missing_levels)}) ---\n")
+                for path in missing_levels:
+                    f.write(f"{path}\n")
+                f.write("\n")
+                
                 f.write(f"--- MISSING MESHES ({len(missing_meshes)}) ---\n")
                 for path in missing_meshes:
                     f.write(f"{path}\n")
@@ -2801,6 +3110,11 @@ class ExportMissingAssetsListOperator(bpy.types.Operator):
                 
                 f.write(f"--- MISSING MATERIALS/DECALS ({len(missing_mats)}) ---\n")
                 for path in missing_mats:
+                    f.write(f"{path}\n")
+                f.write("\n")
+                
+                f.write(f"--- FOUND SUB-LEVELS ({len(found_levels)}) ---\n")
+                for path in found_levels:
                     f.write(f"{path}\n")
                 f.write("\n")
                 
@@ -2846,9 +3160,202 @@ class RefreshAnalysisOperator(bpy.types.Operator):
             self.report({'ERROR'}, f"Refresh failed: {e}")
         return {'FINISHED'}
 
+class AutoExtractAssetsOperator(bpy.types.Operator):
+    bl_idname = "lis.auto_extract_assets"
+    bl_label = "Auto-Extract Assets from Game"
+    bl_description = "Automatically extracts missing assets from game containers using CUE4Parse"
+    
+    _timer = None
+    _process = None
+    _missing_temp_file = None
+    _output_queue = None
+    _output_thread = None
+    
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            # Drain the output queue (non-blocking, filled by reader thread)
+            import queue as _queue
+            while True:
+                try:
+                    line = self._output_queue.get_nowait()
+                    print(f"[UE Extractor] {line}")
+                except _queue.Empty:
+                    break
+                    
+            ret = self._process.poll()
+            if ret is not None:
+                # Wait for reader thread to finish and drain remaining output
+                if self._output_thread:
+                    self._output_thread.join(timeout=2.0)
+                import queue as _queue
+                while True:
+                    try:
+                        line = self._output_queue.get_nowait()
+                        print(f"[UE Extractor] {line}")
+                    except _queue.Empty:
+                        break
+                self.report_cleanup(context)
+                if ret == 0:
+                    self.report({'INFO'}, "Extraction completed! Check Window > Toggle System Console for details.")
+                    try:
+                        run_asset_analysis(context.scene.my_tool)
+                    except Exception as e:
+                        print(f"Error refreshing analysis: {e}")
+                else:
+                    self.report({'ERROR'}, f"Extraction failed (exit code {ret}). Open Window > Toggle System Console for details.")
+                return {'FINISHED'}
+                
+        return {'PASS_THROUGH'}
+        
+    def report_cleanup(self, context):
+        wm = context.window_manager
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        self._process = None
+        self._output_thread = None
+        self._output_queue = None
+        
+        context.scene.my_tool.import_progress = 0.0
+        context.scene.my_tool.import_status = "Idle"
+        
+        if self._missing_temp_file and os.path.exists(self._missing_temp_file):
+            try:
+                os.remove(self._missing_temp_file)
+            except Exception as e:
+                print(f"Failed to remove temp file {self._missing_temp_file}: {e}")
+                
+    def execute(self, context):
+        import subprocess
+        mytool = context.scene.my_tool
+        
+        json_path = mytool.json_file
+        base_dir = mytool.base_directory
+        paks_dir = mytool.game_paks_path
+        aes_key = mytool.game_aes_key
+        usmap_path = mytool.game_usmap_path
+        
+        if not json_path or not os.path.exists(json_path):
+            self.report({'ERROR'}, "Please select a UMAP JSON file first")
+            return {'CANCELLED'}
+            
+        if not base_dir or not os.path.exists(base_dir):
+            self.report({'ERROR'}, "Please select an Assets Base Directory")
+            return {'CANCELLED'}
+            
+        if not paks_dir or not os.path.exists(paks_dir):
+            self.report({'ERROR'}, "Please select the Game Paks Directory")
+            return {'CANCELLED'}
+            
+        file_index = get_cached_index(base_dir)
+        disabled_sublevels = {item.package_path for item in mytool.sublevels if not item.enabled}
+        referenced_assets = get_all_referenced_assets(json_path, base_dir, file_index, disabled_sublevels)
+        
+        missing_list = []
+        for asset_type, ue_path in referenced_assets:
+            clean_path = clean_unreal_path(ue_path)
+            if not clean_path:
+                continue
+                
+            found = False
+            if asset_type == "mesh" and is_basic_shape(ue_path):
+                found = True
+            elif asset_type == "material" and is_basic_shape_material(ue_path):
+                found = True
+            elif file_index:
+                if asset_type == "mesh":
+                    preferred = {'.gltf', '.glb', '.fbx', '.obj'}
+                elif asset_type == "level":
+                    preferred = {'.json'}
+                else:
+                    preferred = {'.json', '.mat'}
+                found_path = resolve_file_path(file_index, clean_path, preferred_exts=preferred)
+                if found_path:
+                    found = True
+                    
+            if not found:
+                missing_list.append(ue_path)
+                
+        print(f"[AutoExtract] Total referenced assets: {len(list(referenced_assets.__class__.__mro__))}")
+        print(f"[AutoExtract] Missing assets count: {len(missing_list)}")
+        for i, p in enumerate(missing_list[:10]):
+            print(f"[AutoExtract]   [{i}] {p}")
+        if len(missing_list) > 10:
+            print(f"[AutoExtract]   ... and {len(missing_list)-10} more")
+                
+        if not missing_list:
+            self.report({'INFO'}, "No missing assets to extract — all assets already present in Asset Dir.")
+            return {'FINISHED'}
+            
+        self._missing_temp_file = os.path.join(os.path.dirname(json_path), "missing_assets_temp.json")
+        try:
+            with open(self._missing_temp_file, 'w', encoding='utf-8') as f:
+                json.dump(missing_list, f, indent=4)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to create temporary list file: {e}")
+            return {'CANCELLED'}
+            
+        addon_dir = os.path.dirname(os.path.abspath(__file__))
+        extractor_path = os.path.join(addon_dir, "ue_extractor.exe")
+        
+        if not os.path.exists(extractor_path):
+            self.report({'ERROR'}, f"ue_extractor.exe not found!\nExpected next to blender_umap_importer.py:\n{extractor_path}")
+            if os.path.exists(self._missing_temp_file):
+                os.remove(self._missing_temp_file)
+            return {'CANCELLED'}
+                
+        cmd = [
+            extractor_path,
+            "--paks", paks_dir,
+            "--list", self._missing_temp_file,
+            "--out", base_dir
+        ]
+        if aes_key:
+            cmd.extend(["--key", aes_key])
+        if usmap_path and os.path.exists(usmap_path):
+            cmd.extend(["--mappings", usmap_path])
+            
+        print(f"Running extractor command: {' '.join(cmd)}")
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to launch extractor: {e}")
+            if os.path.exists(self._missing_temp_file):
+                os.remove(self._missing_temp_file)
+            return {'CANCELLED'}
+        
+        # Start background thread to read stdout without blocking
+        import queue, threading
+        self._output_queue = queue.Queue()
+        def _reader(proc, q):
+            try:
+                for line in proc.stdout:
+                    q.put(line.rstrip())
+            except Exception:
+                pass
+        self._output_thread = threading.Thread(target=_reader, args=(self._process, self._output_queue), daemon=True)
+        self._output_thread.start()
+            
+        mytool.import_status = "Extracting assets from game files..."
+        mytool.import_progress = 50.0
+        
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.2, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
 classes = (
     LIS_ReferencedFolderItem,
     LIS_UL_referenced_folders,
+    LIS_SubLevelItem,
+    LIS_UL_sublevels,
     ShowMissingInfoOperator,
     MISettings,
     VIEW3D_PT_map_importer_panel,
@@ -2856,6 +3363,7 @@ classes = (
     MaterialImporter,
     ExportMissingAssetsListOperator,
     RefreshAnalysisOperator,
+    AutoExtractAssetsOperator,
 )
 
 def register():

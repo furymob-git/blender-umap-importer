@@ -6,3 +6,10 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# UE Extractor - C# project and compiled binary
+ue_extractor
+ue_extractor.exe
+
+# Addon distribution zip
+blender_umap_importer_addon.zip
