@@ -101,6 +101,11 @@ class MISettings(bpy.types.PropertyGroup):
         description="Do not import objects whose corresponding material JSON files are missing on disk",
         default=False,
     )
+    import_decals: bpy.props.BoolProperty(
+        name="Import Decals",
+        description="Enable or disable importing Unreal decals",
+        default=True,
+    )
     disable_viewport_refresh: bpy.props.BoolProperty(
         name="Disable Viewport Refresh",
         description="Do not refresh the 3D viewport during import to significantly speed up the process",
@@ -169,6 +174,7 @@ class VIEW3D_PT_map_importer_panel(bpy.types.Panel):
         self.layout.prop(mytool, "hide_collisions")
         self.layout.prop(mytool, "skip_missing_assets")
         self.layout.prop(mytool, "skip_missing_materials")
+        self.layout.prop(mytool, "import_decals")
         
         row = self.layout.row()
         row.operator(MapImporter.bl_idname, text="Import Level")
@@ -1117,17 +1123,12 @@ def import_asset(filepath, name, collection, hide_collisions=False):
         except Exception:
             pass
             
-    if len(roots) == 1:
-        root_obj = roots[0]
-        root_obj.name = name
-        return root_obj
-    else:
-        # Multiple root objects: group under a single parent empty wrapper
-        empty_root = bpy.data.objects.new(name=name, object_data=None)
-        collection.objects.link(empty_root)
-        for r in roots:
-            r.parent = empty_root
-        return empty_root
+    # Always wrap imported asset roots under a parent Empty to protect orientation transforms
+    empty_root = bpy.data.objects.new(name=name, object_data=None)
+    collection.objects.link(empty_root)
+    for r in roots:
+        r.parent = empty_root
+    return empty_root
 
 def create_decal_plane_mesh(name, material, collection):
     """
@@ -1298,6 +1299,7 @@ class MapImporter(bpy.types.Operator):
         hide_collisions = mytool.hide_collisions
         skip_missing_assets = mytool.skip_missing_assets
         skip_missing_materials = mytool.skip_missing_materials
+        import_decals = mytool.import_decals
         
         # 1. Directory indexing
         mytool.import_status = "Scanning asset directory..."
@@ -1549,6 +1551,8 @@ class MapImporter(bpy.types.Operator):
                 
             # Decal Projection Support
             elif etype == "DecalComponent":
+                if not import_decals:
+                    continue
                 mat_ref = props.get("DecalMaterial")
                 mat_name = None
                 if mat_ref:
@@ -1699,6 +1703,161 @@ class MapImporter(bpy.types.Operator):
             import_collection.hide_viewport = False
         yield True
 
+def find_fallback_textures(file_index, mat_name, mat_file_path, base_dir):
+    """
+    Attempts to find matching textures (Diffuse, Normal, ORM/AORM, Emissive) on disk
+    by performing a smart keyword and folder-proximity search in the file index.
+    Used as a fallback when a material instance JSON is empty or missing texture references.
+    """
+    if not file_index or not base_dir:
+        return {}
+        
+    import re
+    import os
+    
+    # 1. Tokenize and clean material name to extract search keywords
+    name_lower = mat_name.lower()
+    
+    # Strip common prefixes
+    for prefix in ("mi_", "m_", "mm_", "mli_", "mlb_", "t_", "tx_"):
+        if name_lower.startswith(prefix):
+            name_lower = name_lower[len(prefix):]
+            break
+            
+    # Strip common suffixes/variants
+    name_clean = re.sub(r'(_inst|_constant|_mat|_material|_\d+|_[a-z])+$', '', name_lower)
+    
+    # Split by separators to get keyword tokens
+    keywords = [k for k in re.split(r'[-_\s]', name_clean) if k and len(k) >= 3]
+    
+    # Fallback to name_clean if all tokens are too short
+    if not keywords and name_clean:
+        keywords = [name_clean]
+        
+    if not keywords:
+        return {}
+        
+    # We use the last keyword as the primary search term (e.g. "concrete" in "basic_concrete")
+    search_keyword = keywords[-1]
+    
+    # 2. Search index for candidate image files containing the search keyword
+    img_exts = {'.png', '.tga', '.jpg', '.jpeg', '.dds'}
+    candidates = []
+    
+    for key, paths in file_index.items():
+        if search_keyword in key:
+            for path in paths:
+                ext = os.path.splitext(path)[1].lower()
+                if ext in img_exts:
+                    candidates.append(path)
+                    
+    if not candidates:
+        return {}
+        
+    # Deduplicate candidates
+    candidates = list(set(candidates))
+    
+    # 3. Categorize candidates by texture type based on filename suffix pattern
+    diffuse_cands = []
+    normal_cands = []
+    mask_cands = []
+    emissive_cands = []
+    
+    for path in candidates:
+        fname = os.path.splitext(os.path.basename(path))[0].lower()
+        
+        # Check normal map patterns
+        if any(x in fname for x in ("_n", "normal", "nrm", "normals", "nmap")):
+            normal_cands.append(path)
+        # Check diffuse/color patterns
+        elif any(x in fname for x in ("_c", "_d", "basecolor", "albedo", "color", "diffuse", "_bc", "colour")):
+            diffuse_cands.append(path)
+        # Check mask/AORM/ORM patterns
+        elif any(x in fname for x in ("_orm", "_aorm", "_mask", "mask", "masks", "_mra", "_srm", "metallicroughness")):
+            mask_cands.append(path)
+        # Check emissive patterns
+        elif any(x in fname for x in ("_e", "emissive", "emiss", "glow")):
+            emissive_cands.append(path)
+            
+    # 4. Scoring function to find the best candidate in each category
+    def score_candidate(path):
+        fname = os.path.splitext(os.path.basename(path))[0].lower()
+        tex_dir = os.path.dirname(path).replace('\\', '/').lower()
+        mat_dir = os.path.dirname(mat_file_path).replace('\\', '/').lower() if mat_file_path else None
+        
+        score = 0
+        
+        # Match keywords in filename
+        matched_kws = 0
+        for kw in keywords:
+            if kw in fname:
+                score += 15
+                matched_kws += 1
+                
+        # Bonus if all keywords matched
+        if matched_kws == len(keywords):
+            score += 35
+            
+        # Perfect match bonus: strip prefix/suffix and compare
+        stripped_tex = re.sub(r'^(t_|tx_)', '', fname)
+        stripped_tex = re.sub(r'(_[cnd]|_basecolor|_normal|_orm|_aorm|_albedo|_color|_diffuse|_bc|_e|_emissive)+$', '', stripped_tex)
+        if stripped_tex == name_clean:
+            score += 50
+            
+        # Penalty if texture is specialized but material name is not
+        specialized_words = {
+            "plaster", "patch", "rubble", "block", "wall", "ceiling", "floor", "fence",
+            "column", "beam", "brick", "pipe", "radiator", "railing", "shelf", "sign",
+            "window", "barrier", "post", "panel", "tile", "stair", "door", "steps"
+        }
+        for word in specialized_words:
+            if word in fname and word not in name_lower:
+                score -= 40
+                
+        # Global shared directory bonus
+        if "materiallayer" in tex_dir:
+            score += 5
+            
+        # Folder proximity: count shared directory components relative to base_dir
+        if mat_dir:
+            try:
+                mat_rel = os.path.relpath(mat_dir, base_dir).replace('\\', '/').split('/')
+                tex_rel = os.path.relpath(tex_dir, base_dir).replace('\\', '/').split('/')
+                common = 0
+                for i in range(min(len(mat_rel), len(tex_rel))):
+                    if mat_rel[i] == tex_rel[i]:
+                        common += 1
+                    else:
+                        break
+                score += common * 10
+            except Exception:
+                pass
+            
+        # Length penalty to favor cleaner, shorter names
+        score -= len(fname) * 0.2
+        
+        return score
+        
+    fallback = {}
+    
+    if diffuse_cands:
+        diffuse_cands.sort(key=score_candidate, reverse=True)
+        fallback["diffuse"] = os.path.splitext(os.path.basename(diffuse_cands[0]))[0]
+        
+    if normal_cands:
+        normal_cands.sort(key=score_candidate, reverse=True)
+        fallback["normal"] = os.path.splitext(os.path.basename(normal_cands[0]))[0]
+        
+    if mask_cands:
+        mask_cands.sort(key=score_candidate, reverse=True)
+        fallback["mask"] = os.path.splitext(os.path.basename(mask_cands[0]))[0]
+        
+    if emissive_cands:
+        emissive_cands.sort(key=score_candidate, reverse=True)
+        fallback["emissive"] = os.path.splitext(os.path.basename(emissive_cands[0]))[0]
+        
+    return fallback
+
 class MaterialImporter(bpy.types.Operator):
     bl_idname = "lis.mat_import"
     bl_label = "Material Importer"
@@ -1773,7 +1932,9 @@ class MaterialImporter(bpy.types.Operator):
                             if isinstance(tp_vals, list):
                                 for tp in tp_vals:
                                     if isinstance(tp, dict):
-                                        param_name = tp.get("ParameterInfo", {}).get("Name", "")
+                                        param_info = tp.get("ParameterInfo", {})
+                                        param_name = param_info.get("Name", "")
+                                        param_index = param_info.get("Index", -1)
                                         param_val = tp.get("ParameterValue")
                                         if param_val:
                                             if isinstance(param_val, dict):
@@ -1782,17 +1943,27 @@ class MaterialImporter(bpy.types.Operator):
                                                 obj_name = str(param_val)
                                             if obj_name:
                                                 tex_name = obj_name.split("'")[1] if "'" in obj_name else obj_name
-                                                add_tex(param_name, tex_name.split('.')[0])
+                                                clean_tex = tex_name.split('.')[0]
+                                                add_tex(param_name, clean_tex)
+                                                if param_index != -1:
+                                                    add_tex(f"{param_name}_{param_index}", clean_tex)
+                                                    add_tex(f"{param_name}{param_index}", clean_tex)
                                                 
                             sp_vals = data_item.get("ScalarParameterValues", [])
                             if isinstance(sp_vals, list):
                                 for sp in sp_vals:
                                     if isinstance(sp, dict):
-                                        param_name = sp.get("ParameterInfo", {}).get("Name", "")
+                                        param_info = sp.get("ParameterInfo", {})
+                                        param_name = param_info.get("Name", "")
+                                        param_index = param_info.get("Index", -1)
                                         param_val = sp.get("ParameterValue")
                                         if param_name and param_val is not None:
                                             try:
-                                                scalars[param_name.lower()] = float(param_val)
+                                                val_float = float(param_val)
+                                                scalars[param_name.lower()] = val_float
+                                                if param_index != -1:
+                                                    scalars[f"{param_name.lower()}_{param_index}"] = val_float
+                                                    scalars[f"{param_name.lower()}{param_index}"] = val_float
                                             except (ValueError, TypeError):
                                                 pass
                                                 
@@ -1800,15 +1971,21 @@ class MaterialImporter(bpy.types.Operator):
                             if isinstance(vp_vals, list):
                                 for vp in vp_vals:
                                     if isinstance(vp, dict):
-                                        param_name = vp.get("ParameterInfo", {}).get("Name", "")
+                                        param_info = vp.get("ParameterInfo", {})
+                                        param_name = param_info.get("Name", "")
+                                        param_index = param_info.get("Index", -1)
                                         param_val = vp.get("ParameterValue")
                                         if param_name and isinstance(param_val, dict):
-                                            vectors[param_name.lower()] = (
+                                            val_vec = (
                                                 param_val.get("R", 0.0),
                                                 param_val.get("G", 0.0),
                                                 param_val.get("B", 0.0),
                                                 param_val.get("A", 1.0)
                                             )
+                                            vectors[param_name.lower()] = val_vec
+                                            if param_index != -1:
+                                                vectors[f"{param_name.lower()}_{param_index}"] = val_vec
+                                                vectors[f"{param_name.lower()}{param_index}"] = val_vec
                                             
                             for k, v in data_item.items():
                                 k_lower = k.lower()
@@ -1832,7 +2009,7 @@ class MaterialImporter(bpy.types.Operator):
                                         add_tex(k, tex_name.split('.')[0])
                                 elif isinstance(v, list):
                                     extract_local_params(v)
-
+ 
                             cached = data_item.get("CachedExpressionData")
                             if isinstance(cached, dict):
                                 runtime_scalars = cached.get("RuntimeEntries") or cached.get("RuntimeEntries[0]")
@@ -1842,8 +2019,13 @@ class MaterialImporter(bpy.types.Operator):
                                     for idx, p in enumerate(p_info):
                                         if idx < len(scalar_vals):
                                             name = p.get("Name")
+                                            p_index = p.get("Index", -1)
                                             if name:
-                                                scalars[name.lower()] = float(scalar_vals[idx])
+                                                val_float = float(scalar_vals[idx])
+                                                scalars[name.lower()] = val_float
+                                                if p_index != -1:
+                                                    scalars[f"{name.lower()}_{p_index}"] = val_float
+                                                    scalars[f"{name.lower()}{p_index}"] = val_float
                                 
                                 runtime_vectors = cached.get("RuntimeEntries[1]")
                                 if isinstance(runtime_vectors, dict):
@@ -1852,14 +2034,19 @@ class MaterialImporter(bpy.types.Operator):
                                     for idx, p in enumerate(p_info):
                                         if idx < len(vector_vals):
                                             name = p.get("Name")
+                                            p_index = p.get("Index", -1)
                                             val = vector_vals[idx]
                                             if name and isinstance(val, dict):
-                                                vectors[name.lower()] = (
+                                                val_vec = (
                                                     val.get("R", 0.0),
                                                     val.get("G", 0.0),
                                                     val.get("B", 0.0),
                                                     val.get("A", 1.0)
                                                 )
+                                                vectors[name.lower()] = val_vec
+                                                if p_index != -1:
+                                                    vectors[f"{name.lower()}_{p_index}"] = val_vec
+                                                    vectors[f"{name.lower()}{p_index}"] = val_vec
                                                 
                                 runtime_textures = cached.get("RuntimeEntries[3]")
                                 if isinstance(runtime_textures, dict):
@@ -1868,12 +2055,17 @@ class MaterialImporter(bpy.types.Operator):
                                     for idx, p in enumerate(p_info):
                                         if idx < len(tex_vals):
                                             name = p.get("Name")
+                                            p_index = p.get("Index", -1)
                                             val = tex_vals[idx]
                                             if name and isinstance(val, dict):
                                                 asset_path = val.get("AssetPathName")
                                                 if asset_path:
                                                     tex_name = asset_path.split("'")[1] if "'" in asset_path else asset_path
-                                                    add_tex(name, tex_name.split('.')[0])
+                                                    clean_tex = tex_name.split('.')[0]
+                                                    add_tex(name, clean_tex)
+                                                    if p_index != -1:
+                                                        add_tex(f"{name}_{p_index}", clean_tex)
+                                                        add_tex(f"{name}{p_index}", clean_tex)
                         elif isinstance(data_item, list):
                             for item in data_item:
                                 extract_local_params(item)
@@ -1941,7 +2133,6 @@ class MaterialImporter(bpy.types.Operator):
             mat_file = resolve_file_path(file_index, mat_name, preferred_exts={'.json', '.mat'})
             if not mat_file:
                 if mat_name.lower() == "basicshapematerial":
-                    # Build a procedural checker grid material
                     material.use_nodes = True
                     nodes = material.node_tree.nodes
                     links = material.node_tree.links
@@ -1956,24 +2147,30 @@ class MaterialImporter(bpy.types.Operator):
                     shader_node = nodes.new(type="ShaderNodeBsdfPrincipled")
                     links.new(material_output.inputs["Surface"], shader_node.outputs["BSDF"])
                     
-                    # Add Checker Texture
                     checker = nodes.new(type="ShaderNodeTexChecker")
-                    checker.inputs["Color1"].default_value = (0.4, 0.4, 0.4, 1.0) # Dark grey
-                    checker.inputs["Color2"].default_value = (0.5, 0.5, 0.5, 1.0) # Light grey
-                    checker.inputs["Scale"].default_value = 10.0 # Scale of checker grid
+                    checker.inputs["Color1"].default_value = (0.4, 0.4, 0.4, 1.0)
+                    checker.inputs["Color2"].default_value = (0.5, 0.5, 0.5, 1.0)
+                    checker.inputs["Scale"].default_value = 10.0
                     
-                    # Connect Checker Color to Principled Base Color
                     links.new(shader_node.inputs["Base Color"], checker.outputs["Color"])
-                    
-                    # Set standard roughness
                     shader_node.inputs["Roughness"].default_value = 0.5
                     print("Generated default procedural grid for BasicShapeMaterial")
                     continue
                 else:
-                    print(f"Material file not found for: {mat_name}")
-                    continue
-                
-            textures, scalars, vectors, mat_data = load_material_data(mat_file)
+                    print(f"Material file not found for: {mat_name}, attempting fuzzy fallback...")
+                    textures = {}
+                    scalars = {}
+                    vectors = {}
+                    mat_data = []
+            else:
+                textures, scalars, vectors, mat_data = load_material_data(mat_file)
+            
+            # Fuzzy match fallback when material has empty/null textures
+            if not textures and file_index:
+                fallback_tex = find_fallback_textures(file_index, mat_name, mat_file, base_dir)
+                if fallback_tex:
+                    print(f"Using fuzzy fallback textures for {mat_name}: {fallback_tex}")
+                    textures.update(fallback_tex)
                     
             if not textures and not scalars and not vectors:
                 continue
@@ -1988,7 +2185,7 @@ class MaterialImporter(bpy.types.Operator):
                 print(f"Preserving existing textures for material: {mat_name}")
                 continue
                 
-            # Extract Set A texture parameter mappings
+            # Extract Set A texture parameter mappings (Layer 1/Base)
             diffuse_tex = (
                 textures.get("diffuse") or 
                 textures.get("basecolor") or 
@@ -2001,7 +2198,23 @@ class MaterialImporter(bpy.types.Operator):
                 textures.get("diffuse1") or 
                 textures.get("diffusetexture") or 
                 textures.get("other[0]") or 
-                textures.get("pm_diffuse")
+                textures.get("pm_diffuse") or
+                textures.get("l1albedo") or 
+                textures.get("l1diffuse") or 
+                textures.get("l1basecolor") or 
+                textures.get("l1color") or 
+                textures.get("albedo_0") or 
+                textures.get("albedo0") or 
+                textures.get("albedo_1") or 
+                textures.get("albedo1") or 
+                textures.get("diffuse_0") or 
+                textures.get("diffuse0") or 
+                textures.get("diffuse_1") or 
+                textures.get("diffuse1") or 
+                textures.get("basecolor_0") or 
+                textures.get("basecolor0") or 
+                textures.get("basecolor_1") or 
+                textures.get("basecolor1")
             )
             normal_tex = (
                 textures.get("normal") or 
@@ -2009,11 +2222,48 @@ class MaterialImporter(bpy.types.Operator):
                 textures.get("normaltexture") or 
                 textures.get("normalmap") or 
                 textures.get("normalcomponent") or 
-                textures.get("pm_normals")
+                textures.get("pm_normals") or
+                textures.get("l1normal") or 
+                textures.get("l1normalmap") or 
+                textures.get("l1norm") or 
+                textures.get("normal_0") or 
+                textures.get("normal0") or 
+                textures.get("normal_1") or 
+                textures.get("normal1")
             )
-            spec_tex = textures.get("specular") or textures.get("spec") or textures.get("specpower")
-            rough_tex = textures.get("roughness") or textures.get("rough") or textures.get("roughnesstex")
-            metallic_tex = textures.get("metallic") or textures.get("metal") or textures.get("metallictex")
+            spec_tex = (
+                textures.get("specular") or 
+                textures.get("spec") or 
+                textures.get("specpower") or
+                textures.get("l1specular") or 
+                textures.get("l1spec") or 
+                textures.get("specular_0") or 
+                textures.get("specular0") or 
+                textures.get("specular_1") or 
+                textures.get("specular1")
+            )
+            rough_tex = (
+                textures.get("roughness") or 
+                textures.get("rough") or 
+                textures.get("roughnesstex") or
+                textures.get("l1roughness") or 
+                textures.get("l1rough") or 
+                textures.get("roughness_0") or 
+                textures.get("roughness0") or 
+                textures.get("roughness_1") or 
+                textures.get("roughness1")
+            )
+            metallic_tex = (
+                textures.get("metallic") or 
+                textures.get("metal") or 
+                textures.get("metallictex") or
+                textures.get("l1metallic") or 
+                textures.get("l1metal") or 
+                textures.get("metallic_0") or 
+                textures.get("metallic0") or 
+                textures.get("metallic_1") or 
+                textures.get("metallic1")
+            )
             mask_tex = (
                 textures.get("masks") or 
                 textures.get("mask") or 
@@ -2026,11 +2276,28 @@ class MaterialImporter(bpy.types.Operator):
                 textures.get("orme(aoroughmatemis)") or 
                 textures.get("srm") or 
                 textures.get("pm_specularmasks") or 
-                textures.get("specularmasks")
+                textures.get("specularmasks") or
+                textures.get("l1mask") or 
+                textures.get("l1orm") or 
+                textures.get("l1aorm") or 
+                textures.get("l1srm") or 
+                textures.get("l1mra") or 
+                textures.get("mask_0") or 
+                textures.get("mask0") or 
+                textures.get("mask_1") or 
+                textures.get("mask1") or 
+                textures.get("aorm_0") or 
+                textures.get("aorm0") or 
+                textures.get("aorm_1") or 
+                textures.get("aorm1") or 
+                textures.get("orm_0") or 
+                textures.get("orm0") or 
+                textures.get("orm_1") or 
+                textures.get("orm1")
             )
             emissive_tex = textures.get("emissive") or textures.get("emissivecolor") or textures.get("emissivetex") or textures.get("emissive_color") or textures.get("emissive_tex") or textures.get("pm_emissive")
             
-            # Extract Set B texture parameter mappings (for Vertex-Color blended materials)
+            # Extract Set B texture parameter mappings (Layer 2/Blend)
             diffuse_tex_b = (
                 textures.get("diffuse_b") or 
                 textures.get("diffuse2") or 
@@ -2048,7 +2315,23 @@ class MaterialImporter(bpy.types.Operator):
                 textures.get("albedodamaget") or 
                 textures.get("diffusedamaget") or 
                 textures.get("basecolordamage") or 
-                textures.get("other[1]")
+                textures.get("other[1]") or
+                textures.get("l2albedo") or 
+                textures.get("l2diffuse") or 
+                textures.get("l2basecolor") or 
+                textures.get("l2color") or 
+                textures.get("albedo_2") or 
+                textures.get("albedo2") or 
+                textures.get("albedo_3") or 
+                textures.get("albedo3") or 
+                textures.get("diffuse_2") or 
+                textures.get("diffuse2") or 
+                textures.get("diffuse_3") or 
+                textures.get("diffuse3") or 
+                textures.get("basecolor_2") or 
+                textures.get("basecolor2") or 
+                textures.get("basecolor_3") or 
+                textures.get("basecolor3")
             )
             normal_tex_b = (
                 textures.get("normal_b") or 
@@ -2061,10 +2344,37 @@ class MaterialImporter(bpy.types.Operator):
                 textures.get("wornnormaltexture") or 
                 textures.get("wornnormalmap") or 
                 textures.get("damagenormalt") or 
-                textures.get("damagenormal")
+                textures.get("damagenormal") or
+                textures.get("l2normal") or 
+                textures.get("l2normalmap") or 
+                textures.get("l2norm") or 
+                textures.get("normal_2") or 
+                textures.get("normal2") or 
+                textures.get("normal_3") or 
+                textures.get("normal3")
             )
-            rough_tex_b = textures.get("roughness_b") or textures.get("rough_b") or textures.get("roughness_2") or textures.get("roughnesstex_b")
-            metallic_tex_b = textures.get("metallic_b") or textures.get("metal_b") or textures.get("metallic_2") or textures.get("metallictex_b")
+            rough_tex_b = (
+                textures.get("roughness_b") or 
+                textures.get("rough_b") or 
+                textures.get("roughnesstex_b") or
+                textures.get("l2roughness") or 
+                textures.get("l2rough") or 
+                textures.get("roughness_2") or 
+                textures.get("roughness2") or 
+                textures.get("roughness_3") or 
+                textures.get("roughness3")
+            )
+            metallic_tex_b = (
+                textures.get("metallic_b") or 
+                textures.get("metal_b") or 
+                textures.get("metallictex_b") or
+                textures.get("l2metallic") or 
+                textures.get("l2metal") or 
+                textures.get("metallic_2") or 
+                textures.get("metallic2") or 
+                textures.get("metallic_3") or 
+                textures.get("metallic3")
+            )
             mask_tex_b = (
                 textures.get("masks_b") or 
                 textures.get("mask_b") or 
@@ -2084,7 +2394,24 @@ class MaterialImporter(bpy.types.Operator):
                 textures.get("wornorm") or 
                 textures.get("wornormh") or 
                 textures.get("wornorme") or 
-                textures.get("wornsrm")
+                textures.get("wornsrm") or
+                textures.get("l2mask") or 
+                textures.get("l2orm") or 
+                textures.get("l2aorm") or 
+                textures.get("l2srm") or 
+                textures.get("l2mra") or 
+                textures.get("mask_2") or 
+                textures.get("mask2") or 
+                textures.get("mask_3") or 
+                textures.get("mask3") or 
+                textures.get("aorm_2") or 
+                textures.get("aorm2") or 
+                textures.get("aorm_3") or 
+                textures.get("aorm3") or 
+                textures.get("orm_2") or 
+                textures.get("orm2") or 
+                textures.get("orm_3") or 
+                textures.get("orm3")
             )
             
             # Resolve image file paths
